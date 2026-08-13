@@ -37,6 +37,7 @@ import subprocess
 import sys
 import time
 import textwrap
+import zlib
 
 # ---------------------------------------------------------------------
 # SELF-INSTALLING — this is the ONLY file you need. If the required
@@ -85,10 +86,34 @@ BRAND = {
     "sand": (245, 240, 224),
     "white": (255, 255, 255),
     "text_dark": (30, 30, 30),
-    "highlight_land": (207, 227, 194),   # the featured country's fill (green)
-    "neighbor_land": (186, 190, 196),    # other countries' fill — a clearly
-                                          # different cool gray, not a shade of the same tan
+    "highlight_land": (61, 168, 99),   # the featured country's fill — a bold,
+                                        # saturated green so it still reads as
+                                        # "the star" next to colorful neighbors
+    "neighbor_land": (186, 190, 196),  # fallback only, if a country name column
+                                        # isn't available to pick a palette color
 }
+
+# Each non-featured country gets its own color from this set (picked
+# deterministically per country name) instead of one flat fill, so
+# neighboring countries are never the same color as each other and the
+# map doesn't read as a flat, muted block. Bold/saturated on purpose —
+# this is a sales piece, not a survey atlas.
+NEIGHBOR_PALETTE = [
+    "#F4A200",  # amber
+    "#7B3FA0",  # purple
+    "#17A398",  # teal
+    "#FF7F50",  # coral orange
+    "#4C7EB5",  # steel blue
+    "#D4A017",  # mustard
+    "#C2478A",  # magenta
+    "#B06A45",  # terracotta
+    "#5B5EA6",  # indigo
+    "#E0607E",  # rose
+]
+
+
+def neighbor_color_for(name) -> str:
+    return NEIGHBOR_PALETTE[zlib.crc32(str(name).encode("utf-8")) % len(NEIGHBOR_PALETTE)]
 
 CANVAS_W, CANVAS_H = 2400, 1600
 HEADER_H = 90
@@ -420,9 +445,9 @@ def draw_neighbor_labels(ax, world_to_plot, country_idx, view_box):
         candidates.append((clipped.area, row[name_col], clipped.representative_point()))
     candidates.sort(key=lambda c: c[0], reverse=True)
     for _, name, point in candidates[:6]:
-        txt = ax.text(point.x, point.y, name, color="#57524a", fontsize=13,
-                       fontstyle="italic", ha="center", va="center", zorder=3)
-        txt.set_path_effects([pe.withStroke(linewidth=3, foreground="white")])
+        txt = ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=15,
+                       fontweight="bold", ha="center", va="center", zorder=3)
+        txt.set_path_effects([pe.withStroke(linewidth=3.5, foreground="white")])
 
 
 def boxes_overlap(a, b):
@@ -455,7 +480,7 @@ def draw_country_name_label(ax, country_geom, country_row, columns, dpi,
         return
     name = country_row[name_col]
     point = country_geom.representative_point()
-    fontsize = 17
+    fontsize = 20
     placed_boxes.append(label_footprint(point.x, point.y, name, fontsize, dpi,
                                          deg_per_px_x, deg_per_px_y, ha="center"))
     txt = ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=fontsize,
@@ -469,11 +494,11 @@ def draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, place
             continue
         lon = city["lon"] + 360 if (wrapped and city["lon"] < 0) else city["lon"]
         marker = "*" if city["is_capital"] else "o"
-        size = 16 if city["is_capital"] else 8
+        size = 20 if city["is_capital"] else 10
         ax.plot(lon, city["lat"], marker, markersize=size,
                  color=hex_of("navy_header"), markeredgecolor="white",
-                 markeredgewidth=1, zorder=7)
-        fontsize = 11
+                 markeredgewidth=1.2, zorder=7)
+        fontsize = 14
         label_text = f"  {city['name']}"
         placed_boxes.append(label_footprint(lon, city["lat"], label_text, fontsize, dpi,
                                              deg_per_px_x, deg_per_px_y, ha="left"))
@@ -486,35 +511,49 @@ def draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, place
 # Offsets to try, in points, nearest-to-marker first — (dx, dy). Beach
 # names cluster tightly on real coastlines, so a single fixed "always
 # to the right" offset collides constantly; trying alternatives and
-# keeping whichever one is actually clear avoids stacking labels
-# on top of each other.
-LABEL_OFFSET_CANDIDATES = [(16, 0), (16, 14), (16, -14), (-16, 0), (-16, 14), (-16, -14), (0, 20), (0, -20)]
+# keeping whichever one is actually clear avoids stacking labels on top
+# of each other. Two distance tiers (near, then farther) so a label can
+# hop clear of a crowded cluster instead of only rotating in place.
+LABEL_OFFSET_CANDIDATES = [
+    (16, 0), (16, 14), (16, -14), (-16, 0), (-16, 14), (-16, -14), (0, 20), (0, -20),
+    (30, 0), (30, 22), (30, -22), (-30, 0), (-30, 22), (-30, -22), (0, 34), (0, -34),
+    (42, 10), (42, -10), (-42, 10), (-42, -10),
+]
+
+
+def overlap_area(a, b):
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ox = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    oy = max(0.0, min(ay1, by1) - max(ay0, by0))
+    return ox * oy
 
 
 def place_label(lon, lat, text, fontsize, dpi, deg_per_px_x, deg_per_px_y, placed_boxes):
-    """Picks the first offset (of LABEL_OFFSET_CANDIDATES) whose estimated
+    """Picks the offset (from LABEL_OFFSET_CANDIDATES) whose estimated
     label footprint doesn't overlap a previously placed label, working in
-    data (lon/lat) coordinates converted from the view's pixel scale."""
+    data (lon/lat) coordinates converted from the view's pixel scale. If
+    every candidate collides with something (a crowded cluster), falls
+    back to whichever candidate overlaps the least instead of always
+    reusing the first (guaranteed-worst) one."""
     pt_to_data_x = deg_per_px_x * dpi / 72.0
     pt_to_data_y = deg_per_px_y * dpi / 72.0
     w = fontsize * 0.62 * (dpi / 72.0) * len(text) * deg_per_px_x
     h = fontsize * 1.3 * (dpi / 72.0) * deg_per_px_y
-    chosen = None
+    best = None  # (total_overlap, dx_pt, dy_pt, ha, box)
     for dx_pt, dy_pt in LABEL_OFFSET_CANDIDATES:
         dx, dy = dx_pt * pt_to_data_x, dy_pt * pt_to_data_y
         ha = "left" if dx_pt >= 0 else "right"
         box = (lon + dx, lat + dy - h / 2, lon + dx + w, lat + dy + h / 2) if ha == "left" \
             else (lon + dx - w, lat + dy - h / 2, lon + dx, lat + dy + h / 2)
-        if not any(boxes_overlap(box, pb) for pb in placed_boxes):
-            chosen = (dx_pt, dy_pt, ha, box)
+        total = sum(overlap_area(box, pb) for pb in placed_boxes)
+        if total == 0:
+            best = (0, dx_pt, dy_pt, ha, box)
             break
-    if chosen is None:
-        dx_pt, dy_pt = LABEL_OFFSET_CANDIDATES[0]
-        dx, dy = dx_pt * pt_to_data_x, dy_pt * pt_to_data_y
-        box = (lon + dx, lat + dy - h / 2, lon + dx + w, lat + dy + h / 2)
-        chosen = (dx_pt, dy_pt, "left", box)
-    placed_boxes.append(chosen[3])
-    return chosen[0], chosen[1], chosen[2]
+        if best is None or total < best[0]:
+            best = (total, dx_pt, dy_pt, ha, box)
+    placed_boxes.append(best[4])
+    return best[1], best[2], best[3]
 
 
 def draw_main_map(world, country_row, pins, cities, out_path, target_w_px, target_h_px):
@@ -536,9 +575,11 @@ def draw_main_map(world, country_row, pins, cities, out_path, target_w_px, targe
             lambda g: fix_dateline_wrap(g)[0] if g is not None else g
         )
 
-    world_to_plot.plot(ax=ax, color=hex_of("neighbor_land"), edgecolor="#8b8f95", linewidth=0.5)
+    name_col = next((c for c in ["NAME", "ADMIN", "SOVEREIGNT"] if c in world_to_plot.columns), None)
+    neighbor_colors = world_to_plot[name_col].map(neighbor_color_for) if name_col else hex_of("neighbor_land")
+    world_to_plot.plot(ax=ax, color=neighbor_colors, edgecolor="white", linewidth=0.7)
     gpd.GeoSeries([country_geom]).plot(
-        ax=ax, color=hex_of("highlight_land"), edgecolor="#5a6b52", linewidth=1.2
+        ax=ax, color=hex_of("highlight_land"), edgecolor="#2f5c3d", linewidth=1.8
     )
 
     draw_neighbor_labels(ax, world_to_plot, country_row.name, shp_box(minx, miny, maxx, maxy))
@@ -557,11 +598,11 @@ def draw_main_map(world, country_row, pins, cities, out_path, target_w_px, targe
         ax.text(lon, pin["lat"], str(pin["number"]),
                  color="white", fontsize=11, fontweight="bold",
                  ha="center", va="center", zorder=10)
-        dx_pt, dy_pt, ha = place_label(lon, pin["lat"], pin["name"], 12, dpi,
+        dx_pt, dy_pt, ha = place_label(lon, pin["lat"], pin["name"], 14, dpi,
                                         deg_per_px_x, deg_per_px_y, placed_label_boxes)
         label = ax.annotate(pin["name"], xy=(lon, pin["lat"]), xytext=(dx_pt, dy_pt),
                              textcoords="offset points", ha=ha, va="center",
-                             color=hex_of("text_dark"), fontsize=12, fontweight="bold", zorder=10)
+                             color=hex_of("text_dark"), fontsize=14, fontweight="bold", zorder=10)
         label.set_path_effects([pe.withStroke(linewidth=3, foreground="white")])
 
     ax.set_xlim(minx, maxx)
@@ -586,7 +627,9 @@ def draw_hemisphere_locator(world, country_row, out_path, box_w, box_h):
     ax.set_facecolor(ocean)
     ax.set_aspect("equal")
 
-    world.plot(ax=ax, color="#e8e4d8", edgecolor="#b0aa96", linewidth=0.3)
+    name_col = next((c for c in ["NAME", "ADMIN", "SOVEREIGNT"] if c in world.columns), None)
+    locator_colors = world[name_col].map(neighbor_color_for) if name_col else hex_of("neighbor_land")
+    world.plot(ax=ax, color=locator_colors, edgecolor="white", linewidth=0.25)
 
     # Highlight the country: fill its true shape, and also drop a bold
     # dot on its centroid so small countries (Fiji, Costa Rica, etc.)
@@ -642,11 +685,11 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     # ---- Header bar ----
     draw.rectangle([0, 0, CANVAS_W, HEADER_H], fill=rgb("navy_header"))
     f_header = load_font(34, bold=True)
-    f_header_small = load_font(24)
+    f_header_small = load_font(26, bold=True)
     draw.text((30, 25), "BEACH BUM BLUEPRINT MAP SERIES", font=f_header, fill=rgb("white"))
-    label = "COUNTRY MAP TEMPLATE"
+    label = WEBSITE.upper()
     w = draw.textlength(label, font=f_header_small)
-    draw.text((CANVAS_W - w - 30, 32), label, font=f_header_small, fill=rgb("white"))
+    draw.text((CANVAS_W - w - 30, 30), label, font=f_header_small, fill=rgb("aqua"))
 
     # ---- Top strip: flag, name, facts (left) + locator (right) ----
     strip_y0 = HEADER_H
