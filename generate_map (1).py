@@ -1022,9 +1022,14 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     # real left edge is well right of name_x.
     name_x = 520
     name_max_w = CANVAS_W - LOCATOR_W - name_x - 40
-    f_title = autosize_font(draw, country_name.upper(), name_max_w, start_size=72, min_size=32)
+    # This is the poster's headline — it reads like a map title, not a
+    # caption, so it starts big (160pt) and only shrinks as far as a
+    # long country name actually forces it to.
+    f_title = autosize_font(draw, country_name.upper(), name_max_w, start_size=160, min_size=48)
     title_w = draw.textlength(country_name.upper(), font=f_title)
     title_x = name_x + (name_max_w - title_w) / 2
+    title_h = f_title.getbbox(country_name.upper())[3]
+    title_y = strip_y0 + (TOP_ROW_H - title_h) / 2
 
     # Flag — fit, never stretched, uniform frame. Centered between the
     # left edge of the poster and wherever the title text actually
@@ -1042,7 +1047,7 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
                     outline=rgb("ocean_blue"), width=3)
     canvas.paste(flag_fitted, (flag_x, flag_y), flag_fitted)
 
-    draw.text((title_x, strip_y0 + 40), country_name.upper(), font=f_title, fill=rgb("text_dark"))
+    draw.text((title_x, title_y), country_name.upper(), font=f_title, fill=rgb("text_dark"))
 
     # Beach pin key — its own dedicated section spanning the full strip
     # width below the flag/title/locator row, instead of squeezed beside
