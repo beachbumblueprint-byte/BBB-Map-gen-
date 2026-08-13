@@ -153,6 +153,10 @@ WORLD_CITIES_URL = (
     "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
     "master/geojson/ne_50m_populated_places.geojson"
 )
+WORLD_MARINE_URL = (
+    "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
+    "master/geojson/ne_50m_geography_marine_polys.geojson"
+)
 
 
 # ---------------------------------------------------------------------
@@ -280,6 +284,17 @@ def load_world_cities() -> gpd.GeoDataFrame:
     if not os.path.exists(cache_path):
         print("Downloading world cities dataset (one-time, ~1MB)...")
         resp = requests.get(WORLD_CITIES_URL, timeout=60)
+        resp.raise_for_status()
+        with open(cache_path, "wb") as f:
+            f.write(resp.content)
+    return gpd.read_file(cache_path)
+
+
+def load_world_marine() -> gpd.GeoDataFrame:
+    cache_path = os.path.join(CACHE_DIR, "world_marine.geojson")
+    if not os.path.exists(cache_path):
+        print("Downloading marine names dataset (one-time, ~1MB)...")
+        resp = requests.get(WORLD_MARINE_URL, timeout=60)
         resp.raise_for_status()
         with open(cache_path, "wb") as f:
             f.write(resp.content)
@@ -452,6 +467,42 @@ def draw_neighbor_labels(ax, world_to_plot, country_idx, view_box):
         txt = ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=19,
                        fontweight="bold", ha="center", va="center", zorder=3)
         txt.set_path_effects([pe.withStroke(linewidth=4.5, foreground="white")])
+
+
+def draw_ocean_labels(ax, marine, view_box, placed_boxes, dpi, deg_per_px_x, deg_per_px_y, max_labels=3):
+    """Labels the major bodies of water visible in the frame (e.g.
+    Pacific Ocean, Caribbean Sea) — orients viewers without a separate
+    atlas, same idea as the neighbor-country labels but for water.
+    Italicized and in the brand's ocean blue to read as clearly
+    different from land labels."""
+    if "name" not in marine.columns:
+        return
+    view_area = view_box.area
+    candidates = []
+    for _, row in marine.iterrows():
+        if row.geometry is None:
+            continue
+        clipped = row.geometry.intersection(view_box)
+        if clipped.is_empty or clipped.area < view_area * 0.01:
+            continue
+        candidates.append((clipped.area, row["name"], clipped.representative_point()))
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    minx, miny, maxx, maxy = view_box.bounds
+    fontsize = 20
+    placed = 0
+    for _, name, point in candidates:
+        if placed >= max_labels:
+            break
+        box = label_footprint(point.x, point.y, name, fontsize, dpi, deg_per_px_x, deg_per_px_y, ha="center")
+        if box[0] < minx or box[2] > maxx or box[1] < miny or box[3] > maxy:
+            continue  # would run off the edge of the frame
+        if any(boxes_overlap(box, pb) for pb in placed_boxes):
+            continue
+        placed_boxes.append(box)
+        txt = ax.text(point.x, point.y, name, color=hex_of("ocean_blue"), fontsize=fontsize,
+                       fontweight="bold", fontstyle="italic", ha="center", va="center", zorder=2)
+        txt.set_path_effects([pe.withStroke(linewidth=4, foreground="white")])
+        placed += 1
 
 
 def boxes_overlap(a, b):
@@ -659,7 +710,7 @@ def draw_diver_flag(ax, lon, lat, number):
     ax.add_artist(ab)
 
 
-def draw_main_map(world, country_row, pins, cities, out_path, target_w_px, target_h_px):
+def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_px, target_h_px):
     dpi = 150
     ocean = hex_of("ocean_light")
     fig, ax = plt.subplots(figsize=(target_w_px / dpi, target_h_px / dpi), dpi=dpi, facecolor=ocean)
@@ -685,11 +736,20 @@ def draw_main_map(world, country_row, pins, cities, out_path, target_w_px, targe
         ax=ax, color=hex_of("highlight_land"), edgecolor="#2f5c3d", linewidth=1.8
     )
 
-    draw_neighbor_labels(ax, world_to_plot, country_row.name, shp_box(minx, miny, maxx, maxy))
+    view_box = shp_box(minx, miny, maxx, maxy)
+    draw_neighbor_labels(ax, world_to_plot, country_row.name, view_box)
 
     deg_per_px_x = (maxx - minx) / target_w_px
     deg_per_px_y = (maxy - miny) / target_h_px
     placed_label_boxes = []
+
+    marine_to_check = marine
+    if wrapped:
+        marine_to_check = marine.copy()
+        marine_to_check["geometry"] = marine_to_check.geometry.apply(
+            lambda g: fix_dateline_wrap(g)[0] if g is not None else g
+        )
+    draw_ocean_labels(ax, marine_to_check, view_box, placed_label_boxes, dpi, deg_per_px_x, deg_per_px_y)
 
     avoid_points = []
     for city in cities:
@@ -927,32 +987,35 @@ def main():
     tmp_dir = os.path.join(CACHE_DIR, "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    print(f"1/6  Looking up facts for {country_name}...")
+    print(f"1/7  Looking up facts for {country_name}...")
     facts = get_country_facts(country_name)
 
-    print("2/6  Loading world boundary data...")
+    print("2/7  Loading world boundary data...")
     world = load_world_boundaries()
     country_row = get_country_geometry(world, country_name)
 
-    print("3/6  Geocoding featured beach pins...")
+    print("3/7  Geocoding featured beach pins...")
     pins = load_beach_pins(args.pins, country_name)
     if not pins:
         print(f"  No pins found for '{country_name}' in {args.pins} — "
               f"add rows there first (see beach_pins_template.csv).")
 
-    print("4/6  Finding cities to label...")
+    print("4/7  Finding cities to label...")
     cities_gdf = load_world_cities()
     cities = get_country_cities(cities_gdf, country_row, country_name)
 
-    print("5/6  Drawing maps...")
+    print("5/7  Loading ocean/sea names...")
+    marine = load_world_marine()
+
+    print("6/7  Drawing maps...")
     main_map_path = os.path.join(tmp_dir, "main_map.png")
     locator_path = os.path.join(tmp_dir, "locator.png")
     main_map_w = CANVAS_W
     main_map_h = CANVAS_H - HEADER_H - TOP_STRIP_H - FOOTER_H
-    draw_main_map(world, country_row, pins, cities, main_map_path, main_map_w, main_map_h)
+    draw_main_map(world, country_row, pins, cities, marine, main_map_path, main_map_w, main_map_h)
     draw_hemisphere_locator(world, country_row, locator_path, LOCATOR_W, LOCATOR_H)
 
-    print("6/6  Composing final poster...")
+    print("7/7  Composing final poster...")
     compose_poster(facts["name"], facts, pins, main_map_path, locator_path, out_path)
 
     print(f"Done: {out_path}")
