@@ -503,7 +503,7 @@ def draw_ocean_labels(ax, marine, view_box, placed_boxes, dpi, deg_per_px_x, deg
         if any(boxes_overlap(box, pb) for pb in placed_boxes):
             continue
         placed_boxes.append(box)
-        ax.text(point.x, point.y, name, color=hex_of("ocean_blue"), fontsize=fontsize,
+        ax.text(point.x, point.y, name, color="black", fontsize=fontsize,
                  fontweight="bold", fontstyle="italic", ha="center", va="center", zorder=2)
         placed += 1
 
@@ -896,13 +896,15 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
 
     # ---- Header bar ---- website is the headline (that's the brand
     # we're selling); the map-series label is small print on the right.
+    # All four corners of the poster (this bar + the footer) use the
+    # same gold accent for their text, consistently.
     draw.rectangle([0, 0, CANVAS_W, HEADER_H], fill=rgb("navy_header"))
     f_header = load_font(34, bold=True)
     f_header_small = load_font(20, bold=True)
     draw.text((30, 25), WEBSITE.upper(), font=f_header, fill=rgb("gold_accent"))
     label = "BEACH BUM BLUEPRINT MAP SERIES"
     w = draw.textlength(label, font=f_header_small)
-    draw.text((CANVAS_W - w - 30, 35), label, font=f_header_small, fill=rgb("white"))
+    draw.text((CANVAS_W - w - 30, 35), label, font=f_header_small, fill=rgb("gold_accent"))
 
     # ---- Top strip: flag, name, facts (left) + locator (right) ----
     strip_y0 = HEADER_H
@@ -1007,7 +1009,7 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     # instead of plain white fading into the navy.
     draw.rectangle([0, CANVAS_H - FOOTER_H, CANVAS_W, CANVAS_H], fill=rgb("navy_header"))
     f_footer_contact = load_font(24, bold=True)
-    draw.text((30, CANVAS_H - FOOTER_H + 22), TAGLINE, font=load_font(19, bold=True), fill=rgb("white"))
+    draw.text((30, CANVAS_H - FOOTER_H + 20), TAGLINE, font=load_font(24, bold=True), fill=rgb("gold_accent"))
     w = draw.textlength(CONTACT_EMAIL, font=f_footer_contact)
     draw.text((CANVAS_W - w - 30, CANVAS_H - FOOTER_H + 20), CONTACT_EMAIL,
               font=f_footer_contact, fill=rgb("gold_accent"))
