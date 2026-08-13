@@ -125,7 +125,9 @@ CANVAS_W, CANVAS_H = 2400, 1600
 HEADER_H = 112             # tall enough for genuinely large corner text —
 FOOTER_H = 92               # this is meant to be viewed on a phone screen
 TOP_STRIP_H = 340          # flag + name + facts strip, full width
-FLAG_BOX_W, FLAG_BOX_H = 300, 190
+FLAG_COLUMN_W = 440        # reserved left column the flag is centered in
+FLAG_BOX_W, FLAG_BOX_H = 380, 240  # most flags share a similar aspect ratio,
+                                    # so a bigger fixed box is safe to standardize on
 
 # Locator box, top-right corner of the top strip. Sized to the real
 # aspect ratio of its world view (see LOCATOR_LAT_MIN/MAX below) so the
@@ -609,10 +611,9 @@ def draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, place
         label_text = f"  {city['name']}"
         placed_boxes.append(label_footprint(lon, city["lat"], label_text, fontsize, dpi,
                                              deg_per_px_x, deg_per_px_y, ha="left"))
-        txt = ax.text(lon, city["lat"], label_text, color=hex_of("navy_header"),
-                       fontsize=fontsize, fontweight="bold" if city["is_capital"] else "normal",
-                       ha="left", va="center", zorder=8)
-        txt.set_path_effects([pe.withStroke(linewidth=3, foreground="white")])
+        ax.text(lon, city["lat"], label_text, color=hex_of("navy_header"),
+                 fontsize=fontsize, fontweight="bold" if city["is_capital"] else "normal",
+                 ha="left", va="center", zorder=8)
 
 
 # Offsets to try, in points, nearest-to-marker first — (dx, dy). Beach
@@ -801,10 +802,9 @@ def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_p
                                     lon + 60 * pt_to_data_x, pin["lat"] + 68 * pt_to_data_y))
         dx_pt, dy_pt, ha = place_label(lon, pin["lat"], pin["name"], 14, dpi,
                                         deg_per_px_x, deg_per_px_y, placed_label_boxes)
-        label = ax.annotate(pin["name"], xy=(lon, pin["lat"]), xytext=(dx_pt, dy_pt),
-                             textcoords="offset points", ha=ha, va="center",
-                             color=hex_of("text_dark"), fontsize=14, fontweight="bold", zorder=10)
-        label.set_path_effects([pe.withStroke(linewidth=3, foreground="white")])
+        ax.annotate(pin["name"], xy=(lon, pin["lat"]), xytext=(dx_pt, dy_pt),
+                     textcoords="offset points", ha=ha, va="center",
+                     color=hex_of("text_dark"), fontsize=14, fontweight="bold", zorder=10)
 
     ax.set_xlim(minx, maxx)
     ax.set_ylim(miny, maxy)
@@ -921,21 +921,24 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     # still render on top of it instead of getting cut by it.
     draw.rectangle([0, strip_y0, CANVAS_W - 1, strip_y1], outline=rgb("navy_header"), width=5)
 
-    # Flag — fit, never stretched, uniform frame
+    # Flag — fit, never stretched, uniform frame. Centered (both ways) in
+    # its own reserved column rather than pinned to the top-left corner,
+    # and sized generously since most flags share a similar aspect ratio.
     try:
         flag_raw = download_flag(facts["cca2"])
         flag_fitted = fit_image_in_box(flag_raw, FLAG_BOX_W, FLAG_BOX_H)
     except Exception as e:
         print(f"  Warning: could not load flag ({e}) — using placeholder.")
         flag_fitted = placeholder_flag(FLAG_BOX_W, FLAG_BOX_H)
-    flag_x, flag_y = 40, strip_y0 + 30
+    flag_x = int((FLAG_COLUMN_W - FLAG_BOX_W) / 2)
+    flag_y = int(strip_y0 + (TOP_STRIP_H - FLAG_BOX_H) / 2)
     draw.rectangle([flag_x - 4, flag_y - 4, flag_x + FLAG_BOX_W + 4, flag_y + FLAG_BOX_H + 4],
                     outline=rgb("ocean_blue"), width=3)
     canvas.paste(flag_fitted, (flag_x, flag_y), flag_fitted)
 
     # Country name — auto-sized so long names never overflow, centered
     # in the space between the flag and the locator
-    name_x = flag_x + FLAG_BOX_W + 40
+    name_x = FLAG_COLUMN_W + 20
     name_max_w = CANVAS_W - LOCATOR_W - name_x - 40
     f_title = autosize_font(draw, country_name.upper(), name_max_w, start_size=72, min_size=32)
     title_w = draw.textlength(country_name.upper(), font=f_title)
