@@ -36,14 +36,14 @@ import os
 import subprocess
 import sys
 import time
-import textwrap
+import zlib
 
 # ---------------------------------------------------------------------
 # SELF-INSTALLING — this is the ONLY file you need. If the required
 # packages aren't installed yet, this installs them automatically the
 # first time you run the script. No separate requirements.txt needed.
 # ---------------------------------------------------------------------
-REQUIRED_PACKAGES = ["requests", "geopandas", "matplotlib", "Pillow", "shapely", "pyproj", "fiona"]
+REQUIRED_PACKAGES = ["requests", "geopandas", "matplotlib", "Pillow", "shapely", "pyproj", "fiona", "numpy"]
 
 
 def ensure_packages_installed():
@@ -61,12 +61,21 @@ def ensure_packages_installed():
 
 ensure_packages_installed()
 
+import numpy as np
 import requests
 import geopandas as gpd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+from matplotlib.path import Path as MplPath
+from matplotlib.patches import PathPatch
 from PIL import Image, ImageDraw, ImageFont
+from shapely.geometry import box as shp_box, Point
+from shapely.ops import transform as shp_transform, unary_union
+from shapely.prepared import prep
 
 # ---------------------------------------------------------------------
 # BRAND CONSTANTS — locked BBB style. Change once here, applies to
@@ -75,24 +84,67 @@ from PIL import Image, ImageDraw, ImageFont
 BRAND = {
     "navy_header": (13, 42, 66),
     "ocean_blue": (27, 110, 140),
+    "ocean_light": (72, 150, 189),  # richer mid-blue — the old pale value
+                                     # (147,197,224) read as washed-out,
+                                     # near-white "naked aqua" rather than
+                                     # an intentional ocean color
     "palm_green": (62, 142, 90),
     "aqua": (44, 184, 174),
     "brick_red": (192, 59, 43),
-    "sand": (245, 240, 224),
+    "sand": (236, 220, 180),        # clearly tan, not a near-white
+    "sand_deep": (216, 194, 143),   # darker end of the top-strip gradient
     "white": (255, 255, 255),
     "text_dark": (30, 30, 30),
-    "hemisphere_shade": (27, 110, 140, 60),  # translucent overlay
+    "highlight_land": (36, 156, 108),   # a modern emerald green for the
+                                         # featured country — still reads as
+                                         # "the star" next to the neighbors
+    "neighbor_land": (200, 202, 206),  # fallback only, if a country name column
+                                        # isn't available to pick a palette color
 }
 
+# Every non-featured (neighbor) country gets the SAME flat tan fill with
+# plain black label text — no per-country color variation, no adaptive
+# contrast switching. A varying earth-tone palette was tried and read as
+# "brown and white" mud on a phone screen; one consistent, light, readable
+# color for every neighbor keeps the featured country's green as the only
+# thing that stands out, and black-on-tan is legible everywhere by
+# construction, so there's nothing to adapt.
+NEIGHBOR_LAND_COLOR = "#D4B483"  # pale gold-tan
+NEIGHBOR_TEXT_COLOR = "#000000"
+
+
+def neighbor_color_for(name) -> str:
+    return NEIGHBOR_LAND_COLOR
+
+
 CANVAS_W, CANVAS_H = 2400, 1600
-HEADER_H = 90
-FOOTER_H = 70
-TOP_STRIP_H = 340          # flag + name + facts strip, full width
-LOCATOR_W = 420            # locator box, top-right corner of top strip
-FLAG_BOX_W, FLAG_BOX_H = 300, 190
+HEADER_H = 112             # tall enough for genuinely large corner text —
+FOOTER_H = 92               # this is meant to be viewed on a phone screen
+TOP_STRIP_H = 560          # flag + name + locator sit in a compact row at
+                            # the top of this strip (see TOP_ROW_H); the
+                            # rest of the strip's height is the beach key's
+                            # dedicated section — this is the map's whole
+                            # point, so it gets a real chunk of the poster
+                            # instead of a cramped map-corner overlay
+TOP_ROW_H = 300            # flag/title/locator row height within the strip
+FLAG_BOX_W, FLAG_BOX_H = 380, 240  # most flags share a similar aspect ratio,
+                                    # so a bigger fixed box is safe to standardize on
+
+ARTWORK_PATH = os.path.join(os.path.dirname(__file__), "assets", "bbb_logo.png")
+
+# Locator box, top-right corner of the top strip. Sized to the real
+# aspect ratio of its world view (see LOCATOR_LAT_MIN/MAX below) so the
+# map fills the box edge-to-edge with no letterboxing, and kept clear
+# of the main map paste below it (see compose_poster).
+LOCATOR_LAT_MIN, LOCATOR_LAT_MAX = -60, 85
+LOCATOR_W = 640
+LOCATOR_H = round(LOCATOR_W * (LOCATOR_LAT_MAX - LOCATOR_LAT_MIN) / 360)
+
+MAX_CITY_LABELS = 1  # capital only — keep the map simple
 
 TAGLINE = "Live Well.  Retire Happy.  Life's Better by the Beach."
 WEBSITE = "www.beachbumblueprint.com"
+CONTACT_EMAIL = "beachbumblueprint@gmail.com"
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -104,6 +156,14 @@ NOMINATIM_HEADERS = {
 WORLD_BOUNDARIES_URL = (
     "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
     "master/geojson/ne_50m_admin_0_countries.geojson"
+)
+WORLD_CITIES_URL = (
+    "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
+    "master/geojson/ne_50m_populated_places.geojson"
+)
+WORLD_MARINE_URL = (
+    "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
+    "master/geojson/ne_50m_geography_marine_polys.geojson"
 )
 
 
@@ -131,7 +191,8 @@ def get_country_facts(country_name: str) -> dict:
     resp.raise_for_status()
     data = resp.json()[0]
 
-    capital = data.get("capital", ["—"])[0]
+    capital_list = data.get("capital") or []
+    capital = capital_list[0] if capital_list else "—"
     languages = ", ".join(data.get("languages", {}).values()) or "—"
     currencies = data.get("currencies", {})
     if currencies:
@@ -159,10 +220,25 @@ def get_country_facts(country_name: str) -> dict:
 
 
 def download_flag(cca2: str) -> Image.Image:
+    if not cca2:
+        raise ValueError("no country code available to look up a flag")
     url = f"https://flagcdn.com/w320/{cca2.lower()}.png"
     resp = requests.get(url, timeout=20)
     resp.raise_for_status()
     return Image.open(io.BytesIO(resp.content)).convert("RGBA")
+
+
+def placeholder_flag(box_w: int, box_h: int) -> Image.Image:
+    """Blank frame with a note, used when no flag is available for a
+    country (e.g. missing/unrecognized ISO code) instead of crashing."""
+    canvas = Image.new("RGBA", (box_w, box_h), (255, 255, 255, 255))
+    d = ImageDraw.Draw(canvas)
+    d.rectangle([0, 0, box_w - 1, box_h - 1], outline=(180, 180, 180), width=2)
+    text = "No flag\navailable"
+    font = load_font(20)
+    d.multiline_text((box_w / 2, box_h / 2), text, font=font, fill=(140, 140, 140),
+                      anchor="mm", align="center")
+    return canvas
 
 
 def fit_image_in_box(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
@@ -209,6 +285,58 @@ def get_country_geometry(world: gpd.GeoDataFrame, country_name: str):
         if not match.empty:
             return match.iloc[0]
     raise ValueError(f"Could not find '{country_name}' in the boundary dataset.")
+
+
+def load_world_cities() -> gpd.GeoDataFrame:
+    cache_path = os.path.join(CACHE_DIR, "world_cities.geojson")
+    if not os.path.exists(cache_path):
+        print("Downloading world cities dataset (one-time, ~1MB)...")
+        resp = requests.get(WORLD_CITIES_URL, timeout=60)
+        resp.raise_for_status()
+        with open(cache_path, "wb") as f:
+            f.write(resp.content)
+    return gpd.read_file(cache_path)
+
+
+def load_world_marine() -> gpd.GeoDataFrame:
+    cache_path = os.path.join(CACHE_DIR, "world_marine.geojson")
+    if not os.path.exists(cache_path):
+        print("Downloading marine names dataset (one-time, ~1MB)...")
+        resp = requests.get(WORLD_MARINE_URL, timeout=60)
+        resp.raise_for_status()
+        with open(cache_path, "wb") as f:
+            f.write(resp.content)
+    return gpd.read_file(cache_path)
+
+
+def get_country_cities(cities: gpd.GeoDataFrame, country_row, country_name: str,
+                        max_cities: int = MAX_CITY_LABELS) -> list:
+    """Picks the capital (if present) plus the largest other cities to
+    label on the main map, using the country name where available and
+    falling back to a spatial match against the country's own geometry
+    (handles cases where the two datasets spell/scope a name differently)."""
+    matches = cities[cities["ADM0NAME"].str.lower() == country_name.lower()] \
+        if "ADM0NAME" in cities.columns else cities.iloc[0:0]
+    if matches.empty:
+        matches = cities[cities.geometry.within(country_row.geometry)]
+    if matches.empty:
+        return []
+
+    matches = matches.copy()
+    matches["_pop"] = matches["POP_MAX"].fillna(0) if "POP_MAX" in matches.columns else 0
+    is_capital_col = matches["ADM0CAP"] == 1 if "ADM0CAP" in matches.columns else matches["_pop"] < 0
+    matches["_is_capital"] = is_capital_col
+    ordered = matches.sort_values(["_is_capital", "_pop"], ascending=[False, False])
+
+    result = []
+    for _, row in ordered.head(max_cities).iterrows():
+        result.append({
+            "name": row.get("NAME") or row.get("NAMEASCII") or "",
+            "lat": float(row.geometry.y),
+            "lon": float(row.geometry.x),
+            "is_capital": bool(row["_is_capital"]),
+        })
+    return result
 
 
 # ---------------------------------------------------------------------
@@ -273,7 +401,7 @@ def load_beach_pins(csv_path: str, country_name: str) -> list:
             query = row.get("geocode_query", "").strip() or f"{row['beach_name']}, {country_name}"
             lat, lon = geocode_place(query)
             pins.append({
-                "number": row["pin_number"],
+                "number": int(row["pin_number"]),
                 "name": row["beach_name"],
                 "lat": lat,
                 "lon": lon,
@@ -287,7 +415,7 @@ def load_beach_pins(csv_path: str, country_name: str) -> list:
 # is added on whichever side is short so the country always fills the
 # frame without being squished (fixes the Chile/Brazil problem).
 # ---------------------------------------------------------------------
-def compute_padded_extent(minx, miny, maxx, maxy, target_aspect, base_pad_frac=0.15):
+def compute_padded_extent(minx, miny, maxx, maxy, target_aspect, base_pad_frac=0.22):
     width = maxx - minx
     height = maxy - miny
     pad_x = width * base_pad_frac
@@ -306,65 +434,562 @@ def compute_padded_extent(minx, miny, maxx, maxy, target_aspect, base_pad_frac=0
     return minx - pad_x, miny - pad_y, maxx + pad_x, maxy + pad_y
 
 
-def draw_main_map(world, country_row, pins, out_path, target_w_px, target_h_px):
+def fix_dateline_wrap(geometry):
+    """Countries that cross the antimeridian (Fiji, Russia's far east,
+    the US via the Aleutians) have geometry spanning from ~+180 to
+    ~-180, so a naive bounding box comes out ~360 degrees wide instead
+    of the country's true (much narrower) extent. When that happens,
+    shift the negative-longitude side by +360 so the country renders
+    as one contiguous landmass instead of the map zooming out to fit
+    the whole globe. Returns (geometry, was_shifted)."""
+    minx, _, maxx, _ = geometry.bounds
+    if maxx - minx <= 180:
+        return geometry, False
+    shifted = shp_transform(lambda x, y, z=None: (x + 360 if x < 0 else x, y), geometry)
+    return shifted, True
+
+
+def hex_of(brand_key):
+    return "#" + "%02x%02x%02x" % BRAND[brand_key][:3]
+
+
+def draw_neighbor_labels(ax, world_to_plot, country_idx, view_box):
+    """Labels other countries visible in the frame (e.g. Nicaragua and
+    Panama around Costa Rica) so the map reads without a separate atlas.
+    Only labels countries with a meaningful amount of visible area, and
+    places the label inside whatever part of them is actually on screen."""
+    name_col = next((c for c in ["NAME", "ADMIN", "SOVEREIGNT"] if c in world_to_plot.columns), None)
+    if name_col is None:
+        return
+    view_area = view_box.area
+    candidates = []
+    for idx, row in world_to_plot.iterrows():
+        if idx == country_idx or row.geometry is None:
+            continue
+        clipped = row.geometry.intersection(view_box)
+        if clipped.is_empty or clipped.area < view_area * 0.0015:
+            continue
+        candidates.append((clipped.area, row[name_col], clipped.representative_point()))
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    for _, name, point in candidates[:6]:
+        ax.text(point.x, point.y, name, color=NEIGHBOR_TEXT_COLOR, fontsize=34,
+                 fontweight="bold", ha="center", va="center", zorder=3, clip_on=True)
+
+
+def draw_ocean_labels(ax, marine, view_box, placed_boxes, dpi, deg_per_px_x, deg_per_px_y, max_labels=3):
+    """Labels the major bodies of water visible in the frame (e.g.
+    Pacific Ocean, Caribbean Sea) — orients viewers without a separate
+    atlas, same idea as the neighbor-country labels but for water.
+    Italicized and in black to read as clearly different from land
+    labels. Uses the same 'biggest actually-open space' search as the
+    country name (find_open_space_point): grid-searches the water
+    body's own visible shape for the point farthest from its boundary
+    that still clears every already-placed label, shrinking the font
+    only if nothing fits — instead of nudging around one starting
+    point, which kept landing in mediocre spots instead of the big
+    open water areas actually available."""
+    if "name" not in marine.columns:
+        return
+    view_area = view_box.area
+    candidates = []
+    for _, row in marine.iterrows():
+        if row.geometry is None:
+            continue
+        clipped = row.geometry.intersection(view_box)
+        if clipped.is_empty or clipped.area < view_area * 0.01:
+            continue
+        candidates.append((clipped.area, row["name"], clipped))
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    placed = 0
+    for _, name, geom in candidates:
+        if placed >= max_labels:
+            break
+        point, fontsize, fit_ok = find_open_space_point(geom, name, 38, dpi, deg_per_px_x, deg_per_px_y,
+                                                          placed_boxes, grid_n=45, min_size_frac=0.6)
+        if not fit_ok:
+            continue  # no clean spot for this one — skip it rather than show a cramped/cut-off label
+        box = label_footprint(point.x, point.y, name, fontsize, dpi, deg_per_px_x, deg_per_px_y, ha="center")
+        placed_boxes.append(box)
+        ax.text(point.x, point.y, name, color="black", fontsize=fontsize,
+                 fontweight="bold", fontstyle="italic", ha="center", va="center", zorder=2, clip_on=True)
+        placed += 1
+
+
+def boxes_overlap(a, b):
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return ax0 < bx1 and ax1 > bx0 and ay0 < by1 and ay1 > by0
+
+
+def label_footprint(lon, lat, text, fontsize, dpi, deg_per_px_x, deg_per_px_y, ha="center"):
+    """Estimated bounding box (in data/lon-lat coordinates) a label would
+    occupy, used only for collision avoidance between labels — doesn't
+    need to be pixel-exact, just close enough to keep text from stacking."""
+    w = fontsize * 0.62 * (dpi / 72.0) * len(text) * deg_per_px_x
+    h = fontsize * 1.3 * (dpi / 72.0) * deg_per_px_y
+    if ha == "left":
+        return (lon, lat - h / 2, lon + w, lat + h / 2)
+    if ha == "right":
+        return (lon - w, lat - h / 2, lon, lat + h / 2)
+    return (lon - w / 2, lat - h / 2, lon + w / 2, lat + h / 2)
+
+
+def find_open_space_point(geometry, text, fontsize, dpi, deg_per_px_x, deg_per_px_y,
+                           avoid_boxes=(), grid_n=60, min_size_frac=0.5):
+    """Finds a spot inside the shape for `text` at `fontsize`: among grid
+    points where the text's own rendered bounding box wouldn't overlap
+    any avoid_boxes (exclusion zones around pins/cities) AND the text
+    fully fits inside the shape, picks whichever is deepest inside the
+    shape (farthest from its own boundary) — the biggest unoccupied
+    void. A country's true geometric "widest" point often coincides
+    with its main pin cluster (that's usually why the cluster is
+    there), so this checks the label's real footprint rather than just
+    a point, and shrinks the font if nothing fits until something does."""
+    minx, miny, maxx, maxy = geometry.bounds
+    boundary = geometry.boundary
+    prepared = prep(geometry)
+
+    size = fontsize
+    # A "fits inside the shape but overlaps another label" placement at
+    # this size is only used if NO size (however small) ever finds a
+    # genuinely clear spot — a smaller clean placement beats a bigger
+    # one sitting on top of, say, the capital's label. Remembered here
+    # (first one found, i.e. the largest size) rather than returned
+    # immediately, so the loop keeps shrinking in search of clear.
+    fallback_fits, fallback_fits_size = None, None
+    while size >= fontsize * min_size_frac:
+        best_clear, best_clear_score = None, -1.0
+        best_fits, best_fits_score = None, -1.0  # fits inside the shape, but overlaps another label
+        best_any, best_any_score = None, -1.0    # last resort — not even guaranteed to fit
+        for i in range(grid_n + 1):
+            x = minx + (maxx - minx) * i / grid_n
+            for j in range(grid_n + 1):
+                y = miny + (maxy - miny) * j / grid_n
+                p = Point(x, y)
+                if not prepared.contains(p):
+                    continue
+                bd = boundary.distance(p)
+                if bd > best_any_score:
+                    best_any_score, best_any = bd, p
+                box = label_footprint(x, y, text, size, dpi, deg_per_px_x, deg_per_px_y, ha="center")
+                fits_inside = prepared.contains(Point(box[0], box[1])) and prepared.contains(Point(box[2], box[3])) \
+                    and prepared.contains(Point(box[0], box[3])) and prepared.contains(Point(box[2], box[1]))
+                if fits_inside:
+                    if bd > best_fits_score:
+                        best_fits_score, best_fits = bd, p
+                    if not any(boxes_overlap(box, ab) for ab in avoid_boxes) and bd > best_clear_score:
+                        best_clear_score, best_clear = bd, p
+        if best_clear is not None:
+            return best_clear, size, True
+        if best_fits is not None and fallback_fits is None:
+            fallback_fits, fallback_fits_size = best_fits, size
+        size -= 2
+    if fallback_fits is not None:
+        return fallback_fits, fallback_fits_size, True
+    # Nothing at any font size ever fit cleanly inside the shape (a
+    # sliver too small/oddly-clipped for the label at any size — e.g. a
+    # water body barely clipping the corner of the frame). Fall back to
+    # the deepest point, clamped so the box can't run off the shape's
+    # own bounds — but flag it as not-really-fitting (fit_ok=False) so
+    # a caller that can afford to just skip a bad placement (e.g. a
+    # "nice to have" ocean label) knows to do that instead of showing
+    # a label crammed into a space too small for it.
+    fallback_size = fontsize * min_size_frac
+    fallback_pt = best_any if best_any is not None else geometry.representative_point()
+    clamped = clamp_point_to_bounds(fallback_pt, text, fallback_size, dpi, deg_per_px_x, deg_per_px_y,
+                                     minx, miny, maxx, maxy)
+    return clamped, fallback_size, False
+
+
+def clamp_point_to_bounds(point, text, size, dpi, deg_per_px_x, deg_per_px_y, minx, miny, maxx, maxy):
+    """Nudges a label anchor point so its rendered box stays within
+    [minx,maxx]x[miny,maxy] — a last-resort safety net for callers that
+    can't guarantee the chosen spot actually fits."""
+    w = size * 0.62 * (dpi / 72.0) * len(text) * deg_per_px_x
+    h = size * 1.3 * (dpi / 72.0) * deg_per_px_y
+    x = min(max(point.x, minx + w / 2), maxx - w / 2) if maxx - minx >= w else (minx + maxx) / 2
+    y = min(max(point.y, miny + h / 2), maxy - h / 2) if maxy - miny >= h else (miny + maxy) / 2
+    return Point(x, y)
+
+
+def avoid_boxes_for(points, dpi, deg_per_px_x, deg_per_px_y, pad_pt=95):
+    """Small exclusion zone around each (lon, lat) clutter point (pins,
+    cities) — generous enough to roughly cover their icon plus a nearby
+    name label — used to keep the big country-name label from landing
+    on top of them."""
+    pad_x = pad_pt * dpi / 72.0 * deg_per_px_x
+    pad_y = pad_pt * dpi / 72.0 * deg_per_px_y
+    return [(x - pad_x, y - pad_y, x + pad_x, y + pad_y) for x, y in points]
+
+
+def draw_country_name_label(ax, country_geom, country_row, columns, dpi,
+                             deg_per_px_x, deg_per_px_y, placed_boxes):
+    """Writes the featured country's own name in the biggest open patch
+    of its landmass, big and bold, so the map is self-labeled even
+    without the title above it. Reserves its footprint so other labels
+    (beach pins, cities) get placed clear of it."""
+    name_col = next((c for c in ["NAME", "NAME_LONG", "ADMIN", "SOVEREIGNT"] if c in columns), None)
+    if name_col is None:
+        return
+    name = country_row[name_col]
+    # Avoids everything already placed for real (pins' actual icon
+    # footprints, the capital's actual label — this runs *after* city
+    # labels now — and ocean labels). A small, densely-pinned country
+    # can have 5-6 pins plus a capital packed into a narrow landmass;
+    # a generic fixed-radius pad around every one of those points (on
+    # top of their real footprints) was blanketing so much of the
+    # interior that no placement was ever genuinely clear, so this
+    # relies on the real, tighter footprints instead. The country name
+    # has the most freedom to move (it searches the whole landmass for
+    # open space), so it's the one that should yield to fixed-position
+    # labels, not the other way around.
+    avoid_boxes = list(placed_boxes)
+    point, fontsize, _fit_ok = find_open_space_point(country_geom, name, 46, dpi,
+                                                       deg_per_px_x, deg_per_px_y, avoid_boxes)
+    box = label_footprint(point.x, point.y, name, fontsize, dpi, deg_per_px_x, deg_per_px_y, ha="center")
+    if any(boxes_overlap(box, ab) for ab in avoid_boxes):
+        # A small, densely-pinned country's "deepest point" (the spot
+        # find_open_space_point prefers) can be the exact same spot the
+        # capital already occupies — no location genuinely fits inside
+        # the shape AND avoids everything, so the search above returns
+        # its best-effort overlapping placement. Try nudging off of it
+        # in a few directions (even slightly outside the shape's own
+        # bounds is preferable to sitting on top of the capital's text).
+        off_x = fontsize * 0.62 * (dpi / 72.0) * deg_per_px_x * 3
+        off_y = fontsize * 1.3 * (dpi / 72.0) * deg_per_px_y
+        for dx, dy in [(0, -off_y), (0, off_y), (-off_x, 0), (off_x, 0),
+                       (-off_x, -off_y), (off_x, -off_y), (-off_x, off_y), (off_x, off_y)]:
+            candidate = label_footprint(point.x + dx, point.y + dy, name, fontsize, dpi,
+                                         deg_per_px_x, deg_per_px_y, ha="center")
+            if not any(boxes_overlap(candidate, ab) for ab in avoid_boxes):
+                point = Point(point.x + dx, point.y + dy)
+                box = candidate
+                break
+    placed_boxes.append(box)
+    ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=fontsize,
+             fontweight="bold", ha="center", va="center", zorder=6, clip_on=True)
+
+
+def draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, placed_boxes):
+    for city in cities:
+        if not city["name"]:
+            continue
+        lon = city["lon"] + 360 if (wrapped and city["lon"] < 0) else city["lon"]
+        is_capital = city["is_capital"]
+        # The capital's label got a lot bigger to actually be readable,
+        # which makes it much more likely to land on a nearby beach pin
+        # (a real case on Costa Rica: San José sits close enough to
+        # several pins in every direction that right, left, above, and
+        # below all landed on something at full size). So for the
+        # capital, search both position (right/left/above/below) AND
+        # size — shrink a step and re-try all four positions before
+        # shrinking further, so it only gets smaller than 30pt when a
+        # genuinely tight cluster of pins forces it to.
+        for fontsize in ([30, 26, 22, 18] if is_capital else [18]):
+            offset_deg = fontsize * 1.5 * (dpi / 72.0) * deg_per_px_y
+            candidates = [("left", 0), ("right", 0), ("center", offset_deg), ("center", -offset_deg)] \
+                if is_capital else [("left", 0)]
+            ha, dy = candidates[0]
+            found = False
+            for candidate_ha, candidate_dy in candidates:
+                text = {"left": f"  {city['name']}", "right": f"{city['name']}  ",
+                        "center": city["name"]}[candidate_ha]
+                box = label_footprint(lon, city["lat"] + candidate_dy, text, fontsize, dpi,
+                                       deg_per_px_x, deg_per_px_y, ha=candidate_ha)
+                if not any(boxes_overlap(box, ab) for ab in placed_boxes):
+                    ha, dy, found = candidate_ha, candidate_dy, True
+                    break
+            if found or fontsize == 18:
+                break
+        marker = "*" if is_capital else "o"
+        size = fontsize * 1.5 if is_capital else 12
+        ax.plot(lon, city["lat"], marker, markersize=size,
+                 color=hex_of("navy_header"), markeredgecolor="white",
+                 markeredgewidth=2.2 if is_capital else 1.2, zorder=7)
+        label_text = {"left": f"  {city['name']}", "right": f"{city['name']}  ",
+                      "center": city["name"]}[ha]
+        placed_boxes.append(label_footprint(lon, city["lat"] + dy, label_text, fontsize, dpi,
+                                             deg_per_px_x, deg_per_px_y, ha=ha))
+        txt = ax.text(lon, city["lat"] + dy, label_text, color=hex_of("navy_header"),
+                 fontsize=fontsize, fontweight="bold" if is_capital else "normal",
+                 ha=ha, va="center", zorder=8, clip_on=True)
+        if is_capital:
+            # A thin white outline (not a thick halo — that was reading
+            # as a white blob behind the text) keeps the capital's label
+            # readable against any fill color on the map (green featured
+            # country, tan neighbor) without looking like its own shape.
+            txt.set_path_effects([pe.withStroke(linewidth=1.5, foreground="white")])
+
+
+
+
+_DIVER_FLAG_CACHE = {}
+
+
+def make_diver_flag_icon(number, px=120):
+    """Renders a classic 'diver down' flag (red field, white diagonal
+    stripe) on a short pole, with the pin number on a badge at its base,
+    as the beach-pin marker. Cached per number since the same number
+    always looks identical."""
+    if number in _DIVER_FLAG_CACHE:
+        return _DIVER_FLAG_CACHE[number]
+
+    img = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    pole_x = px * 0.20
+    pole_bottom = px * 0.94
+    d.line([(pole_x, px * 0.04), (pole_x, pole_bottom)], fill=(50, 50, 50), width=max(2, px // 30))
+
+    flag_left, flag_top = pole_x, px * 0.04
+    flag_right, flag_bottom = px * 0.95, px * 0.50
+    d.rectangle([flag_left, flag_top, flag_right, flag_bottom], fill=(206, 26, 26))
+    d.line([(flag_left, flag_top), (flag_right, flag_bottom)],
+           fill=(255, 255, 255), width=max(3, int((flag_bottom - flag_top) * 0.34)))
+    d.rectangle([flag_left, flag_top, flag_right, flag_bottom], outline=(40, 40, 40), width=max(1, px // 60))
+
+    # Plain white badge, bold black number — a small white circle with
+    # white text on it was reading as illegible noise at map scale;
+    # black-on-white is the highest-contrast, simplest combination and
+    # the badge is bigger now so the number actually reads at a glance.
+    badge_r = px * 0.24
+    badge_cx, badge_cy = pole_x, pole_bottom - badge_r * 0.9
+    d.ellipse([badge_cx - badge_r, badge_cy - badge_r, badge_cx + badge_r, badge_cy + badge_r],
+              fill=(255, 255, 255), outline=(20, 20, 20), width=max(2, px // 40))
+    font = load_font(int(badge_r * 1.5), bold=True)
+    text = str(number)
+    bbox = d.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    d.text((badge_cx - tw / 2 - bbox[0], badge_cy - th / 2 - bbox[1]), text, font=font, fill=(20, 20, 20))
+
+    _DIVER_FLAG_CACHE[number] = img
+    return img
+
+
+def draw_diver_flag(ax, lon, lat, number):
+    icon = make_diver_flag_icon(number)
+    imagebox = OffsetImage(np.asarray(icon), zoom=0.45)
+    ab = AnnotationBbox(imagebox, (lon, lat), frameon=False, box_alignment=(0.20, 0.06),
+                         pad=0, zorder=9)
+    ax.add_artist(ab)
+
+
+def draw_ocean_depth_shading(ax, land_union, minx, miny, maxx, maxy, grid_n=90):
+    """Soft depth gradient for the ocean — lighter near coastlines,
+    deeper brand blue further out — so a big stretch of open water
+    reads as intentional depth shading (like a printed travel map)
+    instead of one flat, boring block of color. Land polygons are
+    drawn on top afterward, so accuracy right at the coastline doesn't
+    matter — this only has to look right offshore."""
+    xs = np.linspace(minx, maxx, grid_n)
+    ys = np.linspace(miny, maxy, grid_n)
+    max_dist = ((maxx - minx) ** 2 + (maxy - miny) ** 2) ** 0.5 * 0.35
+    grid = np.empty((len(ys), len(xs)))
+    for j, y in enumerate(ys):
+        for i, x in enumerate(xs):
+            grid[j, i] = min(land_union.distance(Point(x, y)) / max_dist, 1.0)
+    cmap = LinearSegmentedColormap.from_list("depth", [hex_of("ocean_light"), hex_of("ocean_blue")])
+    # Extent padded slightly past the actual view bounds — imshow's pixel
+    # grid can leave a hairline gap at the exact edge otherwise, letting
+    # the axes' own (much paler) fallback facecolor show through as a
+    # thin light-blue seam down the left/right sides.
+    pad_x, pad_y = (maxx - minx) * 0.01, (maxy - miny) * 0.01
+    ax.imshow(grid, extent=(minx - pad_x, maxx + pad_x, miny - pad_y, maxy + pad_y), origin="lower", cmap=cmap,
+              zorder=0, aspect="auto", interpolation="bilinear")
+
+
+def geometry_to_mpl_path(geometry):
+    """Converts a shapely (Multi)Polygon to a matplotlib Path (honoring
+    holes), so it can be used to clip an imshow gradient to a country's
+    exact shape."""
+    verts, codes = [], []
+    polys = geometry.geoms if geometry.geom_type == "MultiPolygon" else [geometry]
+    for poly in polys:
+        for ring in [poly.exterior, *poly.interiors]:
+            coords = list(ring.coords)
+            if len(coords) < 3:
+                continue
+            verts.extend(coords)
+            codes.extend([MplPath.MOVETO] + [MplPath.LINETO] * (len(coords) - 2) + [MplPath.CLOSEPOLY])
+    return MplPath(verts, codes)
+
+
+def lighten(rgb_tuple, frac):
+    return tuple(min(255, int(c + (255 - c) * frac)) for c in rgb_tuple)
+
+
+def darken(rgb_tuple, frac):
+    return tuple(int(c * (1 - frac)) for c in rgb_tuple)
+
+
+def draw_country_gradient_fill(ax, geometry, base_hex, zorder=1):
+    """Fills a country with a subtle light-to-dark gradient (lighter
+    toward the top) instead of one flat color, clipped exactly to its
+    shape — a bit of polish/depth per country instead of a flat block,
+    without changing the actual hue used to distinguish it."""
+    base_rgb = tuple(int(base_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+    # LinearSegmentedColormap wants 0-1 floats, not 0-255 ints — every
+    # channel was clamping to 1.0 (white) without this conversion.
+    # Kept subtle on purpose: label text sits directly on this fill with
+    # no outline, so contrast needs to stay roughly consistent wherever
+    # a label happens to land, not swing from light to dark across it.
+    to_unit = lambda rgb: tuple(c / 255 for c in rgb)
+    cmap = LinearSegmentedColormap.from_list(
+        "shade", [to_unit(darken(base_rgb, 0.12)), to_unit(lighten(base_rgb, 0.14))])
+    grad = np.linspace(0, 1, 256).reshape(256, 1)
+    gminx, gminy, gmaxx, gmaxy = geometry.bounds
+    im = ax.imshow(grad, extent=(gminx, gmaxx, gminy, gmaxy), origin="lower",
+                    cmap=cmap, aspect="auto", zorder=zorder, interpolation="bilinear")
+    im.set_clip_path(PathPatch(geometry_to_mpl_path(geometry), transform=ax.transData))
+
+
+def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_px, target_h_px):
     dpi = 150
-    fig, ax = plt.subplots(figsize=(target_w_px / dpi, target_h_px / dpi), dpi=dpi)
-    ax.set_facecolor((190 / 255, 220 / 255, 235 / 255))
+    # Fallback facecolor is the *dark* end of the depth-shading gradient,
+    # not the light end — any hairline gap between the gradient imshow
+    # and the true axes edge shows this color, and it needs to blend
+    # with the (mostly darker, open-water) gradient rather than stand
+    # out as a pale seam down the frame's edges.
+    ocean = hex_of("ocean_blue")
+    fig, ax = plt.subplots(figsize=(target_w_px / dpi, target_h_px / dpi), dpi=dpi, facecolor=ocean)
+    ax.set_facecolor(ocean)
     ax.set_aspect("equal")  # preserves true shape — no stretching
 
-    minx, miny, maxx, maxy = country_row.geometry.bounds
+    country_geom, wrapped = fix_dateline_wrap(country_row.geometry)
+    minx, miny, maxx, maxy = country_geom.bounds
     target_aspect = target_w_px / target_h_px
     minx, miny, maxx, maxy = compute_padded_extent(minx, miny, maxx, maxy, target_aspect)
+    view_box = shp_box(minx, miny, maxx, maxy)
 
-    world.plot(ax=ax, color="#e8e4d8", edgecolor="#b0aa96", linewidth=0.5)
-    gpd.GeoSeries([country_row.geometry]).plot(
-        ax=ax, color="#cfe3c2", edgecolor="#5a6b52", linewidth=1.2
+    world_to_plot = world
+    if wrapped:
+        world_to_plot = world.copy()
+        world_to_plot["geometry"] = world_to_plot.geometry.apply(
+            lambda g: fix_dateline_wrap(g)[0] if g is not None else g
+        )
+
+    land_pieces = [country_geom]
+    visible_rows = []
+    for _, row in world_to_plot.iterrows():
+        if row.geometry is None:
+            continue
+        clipped = row.geometry.intersection(view_box)
+        if not clipped.is_empty:
+            land_pieces.append(clipped)
+            visible_rows.append(row)
+    draw_ocean_depth_shading(ax, unary_union(land_pieces), minx, miny, maxx, maxy)
+
+    # Each country gets its own light-to-dark gradient fill (clipped to
+    # its real, unclipped shape — clipping to the view box first would
+    # draw a fake border line at the edge of the frame) instead of one
+    # flat color, for a bit more visual polish.
+    name_col = next((c for c in ["NAME", "ADMIN", "SOVEREIGNT"] if c in world_to_plot.columns), None)
+    for row in visible_rows:
+        color = neighbor_color_for(row[name_col]) if name_col else hex_of("neighbor_land")
+        draw_country_gradient_fill(ax, row.geometry, color, zorder=1)
+    if visible_rows:
+        gpd.GeoSeries([row.geometry for row in visible_rows], crs=world_to_plot.crs).plot(
+            ax=ax, facecolor="none", edgecolor="white", linewidth=0.7, zorder=1.5)
+
+    draw_country_gradient_fill(ax, country_geom, hex_of("highlight_land"), zorder=2)
+    gpd.GeoSeries([country_geom], crs=world_to_plot.crs).plot(
+        ax=ax, facecolor="none", edgecolor="#2f5c3d", linewidth=1.8, zorder=2.5
     )
 
+    draw_neighbor_labels(ax, world_to_plot, country_row.name, view_box)
+
+    deg_per_px_x = (maxx - minx) / target_w_px
+    deg_per_px_y = (maxy - miny) / target_h_px
+    placed_label_boxes = []
+    pt_to_data_x = dpi / 72.0 * deg_per_px_x
+    pt_to_data_y = dpi / 72.0 * deg_per_px_y
+
+    # Reserve space around the cities *before* placing the ocean/sea
+    # labels, so a big label like "North Pacific Ocean" actively steers
+    # clear of them instead of just landing wherever the water body's
+    # biggest visible area happens to be.
+    city_points = [(c["lon"] + 360 if (wrapped and c["lon"] < 0) else c["lon"], c["lat"]) for c in cities]
+    placed_label_boxes.extend(avoid_boxes_for(city_points, dpi, deg_per_px_x, deg_per_px_y, pad_pt=35))
+    # Beach pins get their *real* rendered footprint reserved up front
+    # (same shape used below when the flags are actually drawn), not a
+    # rough symmetric guess — a too-small placeholder here was letting
+    # the capital's label get placed in a spot that looked clear on
+    # paper but the actual diver-flag icon (which extends further up
+    # and to the right of its anchor point than a symmetric box assumes)
+    # then rendered right on top of.
+    pin_boxes = []
     for pin in pins:
-        ax.plot(pin["lon"], pin["lat"], "o", markersize=22,
-                 color="#" + "%02x%02x%02x" % BRAND["brick_red"], zorder=5)
-        ax.text(pin["lon"], pin["lat"], str(pin["number"]),
-                 color="white", fontsize=11, fontweight="bold",
-                 ha="center", va="center", zorder=6)
+        lon = pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"]
+        pin_boxes.append((lon - 8 * pt_to_data_x, pin["lat"] - 5 * pt_to_data_y,
+                           lon + 60 * pt_to_data_x, pin["lat"] + 68 * pt_to_data_y))
+    placed_label_boxes.extend(pin_boxes)
+
+    marine_to_check = marine
+    if wrapped:
+        marine_to_check = marine.copy()
+        marine_to_check["geometry"] = marine_to_check.geometry.apply(
+            lambda g: fix_dateline_wrap(g)[0] if g is not None else g
+        )
+    draw_ocean_labels(ax, marine_to_check, view_box, placed_label_boxes, dpi, deg_per_px_x, deg_per_px_y)
+
+    # Cities (the capital) are placed before the country name, not
+    # after — a city's position is fixed by geography, while the
+    # country name actively searches the whole landmass for open space,
+    # so it's the one that should route around a fixed label instead of
+    # the other way around.
+    draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, placed_label_boxes)
+    draw_country_name_label(ax, country_geom, country_row, world_to_plot.columns,
+                             dpi, deg_per_px_x, deg_per_px_y, placed_label_boxes)
+
+    # Beach names live in the legend only (see compose_poster), not on
+    # the map itself — 5+ names crammed along a coastline never had
+    # enough room to read well, however the labels dodged each other.
+    # The map keeps just the numbered flags; the number ties back to
+    # the (now much bigger) legend entry.
+    for pin in pins:
+        lon = pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"]
+        draw_diver_flag(ax, lon, pin["lat"], pin["number"])
 
     ax.set_xlim(minx, maxx)
     ax.set_ylim(miny, maxy)
     ax.set_axis_off()
     fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    fig.savefig(out_path, dpi=dpi)
+    fig.savefig(out_path, dpi=dpi, facecolor=ocean)
     plt.close(fig)
 
 
-def draw_hemisphere_locator(world, country_row, latlng, out_path, box_px):
-    """One combined locator: shades the country's hemisphere and
-    highlights the country itself — answers 'which half of the globe'
-    and 'exactly where' in a single image."""
+def draw_hemisphere_locator(world, country_row, out_path, box_w, box_h):
+    """One combined locator: whole-world view with the equator marked
+    and the country itself highlighted — answers 'which half of the
+    globe' and 'exactly where' in a single image. Both hemispheres are
+    drawn identically (no shading) so the equator line is the only cue.
+    box_w/box_h must match the view's real aspect ratio (360 wide x
+    (LAT_MAX-LAT_MIN) tall) or the map letterboxes instead of filling
+    the frame."""
     dpi = 150
-    fig, ax = plt.subplots(figsize=(box_px / dpi, box_px / dpi), dpi=dpi)
-    ax.set_facecolor((190 / 255, 220 / 255, 235 / 255))
+    ocean = hex_of("ocean_light")
+    fig, ax = plt.subplots(figsize=(box_w / dpi, box_h / dpi), dpi=dpi, facecolor=ocean)
+    ax.set_facecolor(ocean)
     ax.set_aspect("equal")
 
-    world.plot(ax=ax, color="#e8e4d8", edgecolor="#b0aa96", linewidth=0.3)
+    name_col = next((c for c in ["NAME", "ADMIN", "SOVEREIGNT"] if c in world.columns), None)
+    locator_colors = world[name_col].map(neighbor_color_for) if name_col else hex_of("neighbor_land")
+    world.plot(ax=ax, color=locator_colors, edgecolor="white", linewidth=0.25)
 
-    # Shade the hemisphere the country sits in
-    lat = latlng[0]
-    if lat >= 0:
-        ax.axhspan(0, 90, color="#" + "%02x%02x%02x" % BRAND["ocean_blue"], alpha=0.15)
-    else:
-        ax.axhspan(-90, 0, color="#" + "%02x%02x%02x" % BRAND["ocean_blue"], alpha=0.15)
+    # Highlight the country: fill its true shape, and also drop a bold
+    # dot on its centroid so small countries (Fiji, Costa Rica, etc.)
+    # are still clearly visible at whole-world scale.
+    gpd.GeoSeries([country_row.geometry]).plot(ax=ax, color=hex_of("brick_red"), zorder=4)
+    center = country_row.geometry.representative_point()
+    ax.plot(center.x, center.y, "o", markersize=10, color=hex_of("brick_red"),
+             markeredgecolor="black", markeredgewidth=1.8, zorder=5)
 
-    # Highlight the country
-    gpd.GeoSeries([country_row.geometry]).plot(
-        ax=ax, color="#" + "%02x%02x%02x" % BRAND["brick_red"]
-    )
-
-    ax.axhline(0, color="#555555", linewidth=0.6, linestyle="--")  # equator line
+    ax.axhline(0, color="#555555", linewidth=0.5, linestyle="--", zorder=3)  # equator line
     ax.set_xlim(-180, 180)
-    ax.set_ylim(-60, 85)
+    ax.set_ylim(LOCATOR_LAT_MIN, LOCATOR_LAT_MAX)
     ax.set_axis_off()
     fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    fig.savefig(out_path, dpi=dpi)
+    fig.savefig(out_path, dpi=dpi, facecolor=ocean)
     plt.close(fig)
 
 
@@ -398,64 +1023,166 @@ def rgb(name):
     return BRAND[name][:3]
 
 
+def make_vertical_gradient(w, h, color_a, color_b):
+    """Simple top-to-bottom linear gradient — same idea as the ocean's
+    depth shading, applied to a big flat-colored panel so it reads as
+    intentional shading instead of one flat block."""
+    row = np.linspace(0, 1, h).reshape(h, 1, 1)
+    arr = np.array(color_a) + (np.array(color_b) - np.array(color_a)) * row
+    return Image.fromarray(arr.astype(np.uint8), "RGB").resize((w, h))
+
+
 def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_path):
     canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), rgb("white"))
     draw = ImageDraw.Draw(canvas)
 
-    # ---- Header bar ----
+    # ---- Header bar ---- both contact pieces (website + email) go up
+    # top since that's the whole point of the brand; "map series" is
+    # secondary and moved to the footer instead (see below). This
+    # poster is viewed on phone screens, scaled way down — these corner
+    # texts need to survive that, so they're sized to fill most of the
+    # bar height, not just "readable at full size." All four corners of
+    # the poster (this bar + the footer) use plain white — highest
+    # possible contrast against navy, and neutral enough not to
+    # visually clash with the warm sand strip just below this bar.
     draw.rectangle([0, 0, CANVAS_W, HEADER_H], fill=rgb("navy_header"))
-    f_header = load_font(34, bold=True)
-    f_header_small = load_font(24)
-    draw.text((30, 25), "BEACH BUM BLUEPRINT MAP SERIES", font=f_header, fill=rgb("white"))
-    label = "COUNTRY MAP TEMPLATE"
-    w = draw.textlength(label, font=f_header_small)
-    draw.text((CANVAS_W - w - 30, 32), label, font=f_header_small, fill=rgb("white"))
+    f_header = load_font(56, bold=True)
+    f_header_email = load_font(48, bold=True)
+    draw.text((30, (HEADER_H - 56) / 2 - 6), WEBSITE.upper(), font=f_header, fill=rgb("white"))
+    w = draw.textlength(CONTACT_EMAIL, font=f_header_email)
+    draw.text((CANVAS_W - w - 30, (HEADER_H - 48) / 2 - 4), CONTACT_EMAIL, font=f_header_email, fill=rgb("white"))
 
     # ---- Top strip: flag, name, facts (left) + locator (right) ----
     strip_y0 = HEADER_H
     strip_y1 = HEADER_H + TOP_STRIP_H
-    draw.rectangle([0, strip_y0, CANVAS_W, strip_y1], fill=rgb("sand"))
+    strip_gradient = make_vertical_gradient(CANVAS_W, TOP_STRIP_H, rgb("sand"), rgb("sand_deep"))
+    canvas.paste(strip_gradient, (0, strip_y0))
+    # Frame it so the sand panel reads as its own zone instead of
+    # blending into the map's similarly pale land color right below it.
+    # Drawn now, before any strip content, so labels that slightly
+    # overhang the frame (e.g. "WHERE IN THE WORLD" above the locator)
+    # still render on top of it instead of getting cut by it.
+    draw.rectangle([0, strip_y0, CANVAS_W - 1, strip_y1], outline=rgb("navy_header"), width=5)
 
-    # Flag — fit, never stretched, uniform frame
-    flag_raw = download_flag(facts["cca2"])
-    flag_fitted = fit_image_in_box(flag_raw, FLAG_BOX_W, FLAG_BOX_H)
-    flag_x, flag_y = 40, strip_y0 + 30
+    # Top row of the strip: flag, country name, locator — a compact
+    # band across TOP_ROW_H, with the rest of the strip's height handed
+    # entirely to the beach key below it (see below). Name column starts
+    # at a fixed x — computed first so the flag (below) can be centered
+    # against where this text *actually* renders, not a guessed column
+    # width. The title is itself centered within this column, so its
+    # real left edge is well right of name_x.
+    name_x = 520
+    name_max_w = CANVAS_W - LOCATOR_W - name_x - 40
+    # This is the poster's headline — it reads like a map title, not a
+    # caption, so it starts big (160pt) and only shrinks as far as a
+    # long country name actually forces it to.
+    f_title = autosize_font(draw, country_name.upper(), name_max_w, start_size=160, min_size=48)
+    title_w = draw.textlength(country_name.upper(), font=f_title)
+    title_x = name_x + (name_max_w - title_w) / 2
+    title_h = f_title.getbbox(country_name.upper())[3]
+    title_y = strip_y0 + (TOP_ROW_H - title_h) / 2
+
+    # Flag — fit, never stretched, uniform frame. Centered between the
+    # left edge of the poster and wherever the title text actually
+    # starts (not a fixed guess), and sized generously since most flags
+    # share a similar aspect ratio.
+    try:
+        flag_raw = download_flag(facts["cca2"])
+        flag_fitted = fit_image_in_box(flag_raw, FLAG_BOX_W, FLAG_BOX_H)
+    except Exception as e:
+        print(f"  Warning: could not load flag ({e}) — using placeholder.")
+        flag_fitted = placeholder_flag(FLAG_BOX_W, FLAG_BOX_H)
+    flag_x = max(20, int((title_x - FLAG_BOX_W) / 2))
+    flag_y = int(strip_y0 + (TOP_ROW_H - FLAG_BOX_H) / 2)
     draw.rectangle([flag_x - 4, flag_y - 4, flag_x + FLAG_BOX_W + 4, flag_y + FLAG_BOX_H + 4],
                     outline=rgb("ocean_blue"), width=3)
     canvas.paste(flag_fitted, (flag_x, flag_y), flag_fitted)
 
-    # Country name — auto-sized so long names never overflow
-    name_x = flag_x + FLAG_BOX_W + 40
-    name_max_w = CANVAS_W - LOCATOR_W - name_x - 40
-    f_title = autosize_font(draw, country_name.upper(), name_max_w, start_size=72, min_size=32)
-    draw.text((name_x, strip_y0 + 40), country_name.upper(), font=f_title, fill=rgb("text_dark"))
+    draw.text((title_x, title_y), country_name.upper(), font=f_title, fill=rgb("text_dark"))
 
-    # Facts strip — Capital / Language / Currency / Climate only
-    f_label = load_font(22, bold=True)
-    f_value = load_font(22)
-    facts_y = strip_y0 + 130
-    facts_list = [
-        ("Capital", facts["capital"]),
-        ("Language", facts["language"]),
-        ("Currency", facts["currency"]),
-        ("Climate", facts["climate"]),
-    ]
-    col_w = name_max_w // 2
-    for i, (label_text, value_text) in enumerate(facts_list):
-        col = i % 2
-        row = i // 2
-        fx = name_x + col * col_w
-        fy = facts_y + row * 70
-        draw.text((fx, fy), f"{label_text}:", font=f_label, fill=rgb("ocean_blue"))
-        wrapped = textwrap.shorten(value_text, width=30, placeholder="...")
-        draw.text((fx, fy + 30), wrapped, font=f_value, fill=rgb("text_dark"))
+    # Beach pin key — its own dedicated section spanning the full strip
+    # width below the flag/title/locator row, instead of squeezed beside
+    # them or overlaid on a corner of the map. This is the whole point
+    # of the map, so it gets a real chunk of the poster, sized as big as
+    # this section allows and only shrinking if a map has an unusually
+    # large number of pins.
+    key_section_y0 = strip_y0 + TOP_ROW_H + 15
+    key_label = "BEACHES ON THIS MAP"
+    draw.text((30, key_section_y0), key_label, font=load_font(26, bold=True), fill=rgb("ocean_blue"))
 
-    # Locator — top right corner of the strip
+    key_x0, key_y0 = 30, key_section_y0 + 42
+    key_x1, key_y1 = CANVAS_W - 30, strip_y1 - 15
+    key_row_h, r = 100, 36
+    f_pin_num = load_font(34, bold=True)
+    f_pin_name = load_font(38, bold=True)
+
+    def row_sizes(n, max_per_row):
+        """How many entries go in each row. A plain left-to-right fill
+        left an orphaned single entry stranded on its own row at the
+        end (e.g. 5 pins as 4-then-1) — lopsided instead of balanced.
+        Splitting into rows of at most `max_per_row` and, when there's
+        a leftover, tucking that shorter row into the *middle* of the
+        stack instead of the end reads as balanced/intentional (5 pins
+        becomes 2-1-2 — the same spread as the pips on a die)."""
+        full_rows, remainder = divmod(n, max_per_row)
+        sizes = [max_per_row] * full_rows
+        if remainder:
+            sizes.insert(len(sizes) // 2, remainder)
+        return sizes
+
+    def layout_key(font_num, font_name, r, row_h, max_per_row):
+        """Each row is centered horizontally, with every entry sized to
+        its own name's actual width (not a fixed column width — beach
+        names vary a lot in length)."""
+        sizes = row_sizes(len(pins), max_per_row)
+        entries, idx, y, max_row_w = [], 0, 0, 0
+        for size in sizes:
+            row_pins = pins[idx:idx + size]
+            idx += size
+            widths = [r * 2 + 16 + draw.textlength(p["name"], font=font_name) + 60 for p in row_pins]
+            row_w = sum(widths)
+            max_row_w = max(max_row_w, row_w)
+            x = key_x0 + max(0, (key_x1 - key_x0) - row_w) / 2
+            for p, w in zip(row_pins, widths):
+                entries.append((p, x, y))
+                x += w
+            y += row_h
+        return entries, len(sizes), max_row_w
+
+    # Shrink only as much as needed if this particular map's pins don't
+    # all fit at full size within the section — most maps (5-ish pins)
+    # never hit this. Two per row first (matches the balanced look
+    # above); if names are too long for that even at the smallest
+    # size, fall back to one per row rather than overflowing sideways.
+    max_per_row = 2
+    entries, row_count, max_row_w = layout_key(f_pin_num, f_pin_name, r, key_row_h, max_per_row)
+    while (row_count * key_row_h > (key_y1 - key_y0) or max_row_w > (key_x1 - key_x0)) and key_row_h > 46:
+        key_row_h -= 6
+        r = max(18, r - 3)
+        f_pin_num = load_font(max(20, f_pin_num.size - 3), bold=True)
+        f_pin_name = load_font(max(22, f_pin_name.size - 3), bold=True)
+        entries, row_count, max_row_w = layout_key(f_pin_num, f_pin_name, r, key_row_h, max_per_row)
+    if max_row_w > (key_x1 - key_x0) and max_per_row > 1:
+        max_per_row = 1
+        entries, row_count, max_row_w = layout_key(f_pin_num, f_pin_name, r, key_row_h, max_per_row)
+
+    for pin, ex, ey in entries:
+        cx, cy = ex + r, key_y0 + ey + r
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=rgb("brick_red"), outline=rgb("white"), width=3)
+        num_w = draw.textlength(str(pin["number"]), font=f_pin_num)
+        draw.text((cx - num_w / 2, cy - f_pin_num.size / 2 - 2), str(pin["number"]),
+                   font=f_pin_num, fill=rgb("white"))
+        draw.text((ex + r * 2 + 16, key_y0 + ey + (key_row_h - f_pin_name.size) / 2 - 4), pin["name"],
+                   font=f_pin_name, fill=rgb("text_dark"))
+
+    # Locator — top right corner of the strip. Sized to its true aspect
+    # ratio (see LOCATOR_H) so it fills the box with no letterboxing,
+    # and stays well clear of the main map paste below it.
     loc_x = CANVAS_W - LOCATOR_W - 20
     loc_y = strip_y0 + 20
-    loc_img = Image.open(locator_path).resize((LOCATOR_W, LOCATOR_W))
+    loc_img = Image.open(locator_path).resize((LOCATOR_W, LOCATOR_H))
     canvas.paste(loc_img, (loc_x, loc_y))
-    draw.rectangle([loc_x, loc_y, loc_x + LOCATOR_W, loc_y + LOCATOR_W],
+    draw.rectangle([loc_x, loc_y, loc_x + LOCATOR_W, loc_y + LOCATOR_H],
                     outline=rgb("ocean_blue"), width=3)
     draw.text((loc_x, loc_y - 26), "WHERE IN THE WORLD", font=load_font(18, bold=True), fill=rgb("ocean_blue"))
 
@@ -465,24 +1192,42 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     main_img = Image.open(main_map_path)
     canvas.paste(main_img, (0, map_y0))
 
-    # Beach pin key, bottom-left overlay on the map
-    key_x, key_y = 30, map_y0 + 20
-    f_pin_num = load_font(16, bold=True)
-    f_pin_name = load_font(18)
-    for pin in pins:
-        cx, cy, r = key_x + 12, key_y + 12, 13
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=rgb("brick_red"), outline=rgb("white"), width=2)
-        num_w = draw.textlength(str(pin["number"]), font=f_pin_num)
-        draw.text((cx - num_w / 2, cy - 9), str(pin["number"]), font=f_pin_num, fill=rgb("white"))
-        draw.text((key_x + 34, key_y + 2), pin["name"], font=f_pin_name, fill=rgb("text_dark"))
-        key_y += 32
+    # A dedicated divider, drawn *after* the map paste (the top strip's
+    # own border line sits exactly at this y and was getting overwritten
+    # by the paste above, effectively erasing it).
+    draw.rectangle([0, map_y0 - 3, CANVAS_W, map_y0 + 3], fill=rgb("text_dark"))
 
-    # ---- Footer bar ----
+    # ---- Footer bar ---- tagline stays put; "map series" moved down
+    # here from the header (contact info took over the top bar) — same
+    # big/bold/white treatment either way. The brand artwork now lives
+    # here too, centered between the two texts — it moved out of the
+    # top strip to free that space for the beach key, which needed the
+    # room far more than the artwork did.
     draw.rectangle([0, CANVAS_H - FOOTER_H, CANVAS_W, CANVAS_H], fill=rgb("navy_header"))
-    f_footer = load_font(20, bold=True)
-    draw.text((30, CANVAS_H - FOOTER_H + 22), TAGLINE, font=load_font(16), fill=rgb("white"))
-    w = draw.textlength(WEBSITE, font=f_footer)
-    draw.text((CANVAS_W - w - 30, CANVAS_H - FOOTER_H + 22), WEBSITE, font=f_footer, fill=rgb("white"))
+    footer_half_w = CANVAS_W / 2 - 50
+    f_footer_tagline = autosize_font(draw, TAGLINE, footer_half_w, start_size=40, bold=True, min_size=22)
+    map_series_label = "BEACH BUM BLUEPRINT MAP SERIES"
+    f_footer_series = autosize_font(draw, map_series_label, footer_half_w, start_size=38, bold=True, min_size=22)
+    tagline_h = f_footer_tagline.getbbox(TAGLINE)[3]
+    draw.text((30, (CANVAS_H - FOOTER_H) + (FOOTER_H - tagline_h) / 2), TAGLINE,
+              font=f_footer_tagline, fill=rgb("white"))
+    w = draw.textlength(map_series_label, font=f_footer_series)
+    series_h = f_footer_series.getbbox(map_series_label)[3]
+    draw.text((CANVAS_W - w - 30, (CANVAS_H - FOOTER_H) + (FOOTER_H - series_h) / 2), map_series_label,
+              font=f_footer_series, fill=rgb("white"))
+
+    if os.path.exists(ARTWORK_PATH):
+        # The source asset is solid black ink on transparent — fine on
+        # the light sand strip, invisible on this navy bar, so it's
+        # recolored white (alpha untouched) to match the header/footer
+        # white-on-navy treatment used everywhere else on the poster.
+        artwork_raw = Image.open(ARTWORK_PATH).convert("RGBA")
+        white_artwork = Image.new("RGBA", artwork_raw.size, (255, 255, 255, 0))
+        white_artwork.putalpha(artwork_raw.getchannel("A"))
+        artwork_fitted = fit_image_in_box(white_artwork, 150, FOOTER_H - 16)
+        artwork_x = int((CANVAS_W - artwork_fitted.width) / 2)
+        artwork_y = int(CANVAS_H - FOOTER_H + (FOOTER_H - artwork_fitted.height) / 2)
+        canvas.paste(artwork_fitted, (artwork_x, artwork_y), artwork_fitted)
 
     canvas.save(out_path, "PNG")
 
@@ -502,28 +1247,35 @@ def main():
     tmp_dir = os.path.join(CACHE_DIR, "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    print(f"1/5  Looking up facts for {country_name}...")
+    print(f"1/7  Looking up facts for {country_name}...")
     facts = get_country_facts(country_name)
 
-    print("2/5  Loading world boundary data...")
+    print("2/7  Loading world boundary data...")
     world = load_world_boundaries()
     country_row = get_country_geometry(world, country_name)
 
-    print("3/5  Geocoding featured beach pins...")
+    print("3/7  Geocoding featured beach pins...")
     pins = load_beach_pins(args.pins, country_name)
     if not pins:
         print(f"  No pins found for '{country_name}' in {args.pins} — "
               f"add rows there first (see beach_pins_template.csv).")
 
-    print("4/5  Drawing maps...")
+    print("4/7  Finding cities to label...")
+    cities_gdf = load_world_cities()
+    cities = get_country_cities(cities_gdf, country_row, country_name)
+
+    print("5/7  Loading ocean/sea names...")
+    marine = load_world_marine()
+
+    print("6/7  Drawing maps...")
     main_map_path = os.path.join(tmp_dir, "main_map.png")
     locator_path = os.path.join(tmp_dir, "locator.png")
     main_map_w = CANVAS_W
     main_map_h = CANVAS_H - HEADER_H - TOP_STRIP_H - FOOTER_H
-    draw_main_map(world, country_row, pins, main_map_path, main_map_w, main_map_h)
-    draw_hemisphere_locator(world, country_row, facts["latlng"], locator_path, LOCATOR_W)
+    draw_main_map(world, country_row, pins, cities, marine, main_map_path, main_map_w, main_map_h)
+    draw_hemisphere_locator(world, country_row, locator_path, LOCATOR_W, LOCATOR_H)
 
-    print("5/5  Composing final poster...")
+    print("7/7  Composing final poster...")
     compose_poster(facts["name"], facts, pins, main_map_path, locator_path, out_path)
 
     print(f"Done: {out_path}")
