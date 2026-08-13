@@ -415,7 +415,7 @@ def load_beach_pins(csv_path: str, country_name: str) -> list:
 # is added on whichever side is short so the country always fills the
 # frame without being squished (fixes the Chile/Brazil problem).
 # ---------------------------------------------------------------------
-def compute_padded_extent(minx, miny, maxx, maxy, target_aspect, base_pad_frac=0.15):
+def compute_padded_extent(minx, miny, maxx, maxy, target_aspect, base_pad_frac=0.22):
     width = maxx - minx
     height = maxy - miny
     pad_x = width * base_pad_frac
@@ -550,6 +550,13 @@ def find_open_space_point(geometry, text, fontsize, dpi, deg_per_px_x, deg_per_p
     prepared = prep(geometry)
 
     size = fontsize
+    # A "fits inside the shape but overlaps another label" placement at
+    # this size is only used if NO size (however small) ever finds a
+    # genuinely clear spot — a smaller clean placement beats a bigger
+    # one sitting on top of, say, the capital's label. Remembered here
+    # (first one found, i.e. the largest size) rather than returned
+    # immediately, so the loop keeps shrinking in search of clear.
+    fallback_fits, fallback_fits_size = None, None
     while size >= fontsize * min_size_frac:
         best_clear, best_clear_score = None, -1.0
         best_fits, best_fits_score = None, -1.0  # fits inside the shape, but overlaps another label
@@ -574,9 +581,11 @@ def find_open_space_point(geometry, text, fontsize, dpi, deg_per_px_x, deg_per_p
                         best_clear_score, best_clear = bd, p
         if best_clear is not None:
             return best_clear, size, True
-        if best_fits is not None:
-            return best_fits, size, True
+        if best_fits is not None and fallback_fits is None:
+            fallback_fits, fallback_fits_size = best_fits, size
         size -= 2
+    if fallback_fits is not None:
+        return fallback_fits, fallback_fits_size, True
     # Nothing at any font size ever fit cleanly inside the shape (a
     # sliver too small/oddly-clipped for the label at any size — e.g. a
     # water body barely clipping the corner of the frame). Fall back to
@@ -614,7 +623,7 @@ def avoid_boxes_for(points, dpi, deg_per_px_x, deg_per_px_y, pad_pt=95):
 
 
 def draw_country_name_label(ax, country_geom, country_row, columns, dpi,
-                             deg_per_px_x, deg_per_px_y, placed_boxes, avoid_points):
+                             deg_per_px_x, deg_per_px_y, placed_boxes):
     """Writes the featured country's own name in the biggest open patch
     of its landmass, big and bold, so the map is self-labeled even
     without the title above it. Reserves its footprint so other labels
@@ -623,11 +632,40 @@ def draw_country_name_label(ax, country_geom, country_row, columns, dpi,
     if name_col is None:
         return
     name = country_row[name_col]
-    avoid_boxes = avoid_boxes_for(avoid_points, dpi, deg_per_px_x, deg_per_px_y)
+    # Avoids everything already placed for real (pins' actual icon
+    # footprints, the capital's actual label — this runs *after* city
+    # labels now — and ocean labels). A small, densely-pinned country
+    # can have 5-6 pins plus a capital packed into a narrow landmass;
+    # a generic fixed-radius pad around every one of those points (on
+    # top of their real footprints) was blanketing so much of the
+    # interior that no placement was ever genuinely clear, so this
+    # relies on the real, tighter footprints instead. The country name
+    # has the most freedom to move (it searches the whole landmass for
+    # open space), so it's the one that should yield to fixed-position
+    # labels, not the other way around.
+    avoid_boxes = list(placed_boxes)
     point, fontsize, _fit_ok = find_open_space_point(country_geom, name, 46, dpi,
                                                        deg_per_px_x, deg_per_px_y, avoid_boxes)
-    placed_boxes.append(label_footprint(point.x, point.y, name, fontsize, dpi,
-                                         deg_per_px_x, deg_per_px_y, ha="center"))
+    box = label_footprint(point.x, point.y, name, fontsize, dpi, deg_per_px_x, deg_per_px_y, ha="center")
+    if any(boxes_overlap(box, ab) for ab in avoid_boxes):
+        # A small, densely-pinned country's "deepest point" (the spot
+        # find_open_space_point prefers) can be the exact same spot the
+        # capital already occupies — no location genuinely fits inside
+        # the shape AND avoids everything, so the search above returns
+        # its best-effort overlapping placement. Try nudging off of it
+        # in a few directions (even slightly outside the shape's own
+        # bounds is preferable to sitting on top of the capital's text).
+        off_x = fontsize * 0.62 * (dpi / 72.0) * deg_per_px_x * 3
+        off_y = fontsize * 1.3 * (dpi / 72.0) * deg_per_px_y
+        for dx, dy in [(0, -off_y), (0, off_y), (-off_x, 0), (off_x, 0),
+                       (-off_x, -off_y), (off_x, -off_y), (-off_x, off_y), (off_x, off_y)]:
+            candidate = label_footprint(point.x + dx, point.y + dy, name, fontsize, dpi,
+                                         deg_per_px_x, deg_per_px_y, ha="center")
+            if not any(boxes_overlap(candidate, ab) for ab in avoid_boxes):
+                point = Point(point.x + dx, point.y + dy)
+                box = candidate
+                break
+    placed_boxes.append(box)
     ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=fontsize,
              fontweight="bold", ha="center", va="center", zorder=6, clip_on=True)
 
@@ -676,11 +714,11 @@ def draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, place
                  fontsize=fontsize, fontweight="bold" if is_capital else "normal",
                  ha=ha, va="center", zorder=8, clip_on=True)
         if is_capital:
-            # A capital city label has to survive sitting on top of any
-            # fill color on the map (green featured country, tan
-            # neighbor) — a white halo guarantees contrast either way
-            # instead of relying on one hardcoded text color.
-            txt.set_path_effects([pe.withStroke(linewidth=4, foreground="white")])
+            # A thin white outline (not a thick halo — that was reading
+            # as a white blob behind the text) keeps the capital's label
+            # readable against any fill color on the map (green featured
+            # country, tan neighbor) without looking like its own shape.
+            txt.set_path_effects([pe.withStroke(linewidth=1.5, foreground="white")])
 
 
 
@@ -710,15 +748,19 @@ def make_diver_flag_icon(number, px=120):
            fill=(255, 255, 255), width=max(3, int((flag_bottom - flag_top) * 0.34)))
     d.rectangle([flag_left, flag_top, flag_right, flag_bottom], outline=(40, 40, 40), width=max(1, px // 60))
 
-    badge_r = px * 0.17
+    # Plain white badge, bold black number — a small white circle with
+    # white text on it was reading as illegible noise at map scale;
+    # black-on-white is the highest-contrast, simplest combination and
+    # the badge is bigger now so the number actually reads at a glance.
+    badge_r = px * 0.24
     badge_cx, badge_cy = pole_x, pole_bottom - badge_r * 0.9
     d.ellipse([badge_cx - badge_r, badge_cy - badge_r, badge_cx + badge_r, badge_cy + badge_r],
-              fill=(206, 26, 26), outline=(255, 255, 255), width=max(2, px // 40))
-    font = load_font(int(badge_r * 1.3), bold=True)
+              fill=(255, 255, 255), outline=(20, 20, 20), width=max(2, px // 40))
+    font = load_font(int(badge_r * 1.5), bold=True)
     text = str(number)
     bbox = d.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    d.text((badge_cx - tw / 2 - bbox[0], badge_cy - th / 2 - bbox[1]), text, font=font, fill="white")
+    d.text((badge_cx - tw / 2 - bbox[0], badge_cy - th / 2 - bbox[1]), text, font=font, fill=(20, 20, 20))
 
     _DIVER_FLAG_CACHE[number] = img
     return img
@@ -859,18 +901,28 @@ def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_p
     deg_per_px_x = (maxx - minx) / target_w_px
     deg_per_px_y = (maxy - miny) / target_h_px
     placed_label_boxes = []
+    pt_to_data_x = dpi / 72.0 * deg_per_px_x
+    pt_to_data_y = dpi / 72.0 * deg_per_px_y
 
-    avoid_points = []
-    for city in cities:
-        avoid_points.append((city["lon"] + 360 if (wrapped and city["lon"] < 0) else city["lon"], city["lat"]))
-    for pin in pins:
-        avoid_points.append((pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"], pin["lat"]))
-
-    # Reserve space around the beach pins *before* placing the ocean/sea
+    # Reserve space around the cities *before* placing the ocean/sea
     # labels, so a big label like "North Pacific Ocean" actively steers
-    # clear of the pin cluster instead of just landing wherever the
-    # water body's biggest visible area happens to be.
-    placed_label_boxes.extend(avoid_boxes_for(avoid_points, dpi, deg_per_px_x, deg_per_px_y, pad_pt=35))
+    # clear of them instead of just landing wherever the water body's
+    # biggest visible area happens to be.
+    city_points = [(c["lon"] + 360 if (wrapped and c["lon"] < 0) else c["lon"], c["lat"]) for c in cities]
+    placed_label_boxes.extend(avoid_boxes_for(city_points, dpi, deg_per_px_x, deg_per_px_y, pad_pt=35))
+    # Beach pins get their *real* rendered footprint reserved up front
+    # (same shape used below when the flags are actually drawn), not a
+    # rough symmetric guess — a too-small placeholder here was letting
+    # the capital's label get placed in a spot that looked clear on
+    # paper but the actual diver-flag icon (which extends further up
+    # and to the right of its anchor point than a symmetric box assumes)
+    # then rendered right on top of.
+    pin_boxes = []
+    for pin in pins:
+        lon = pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"]
+        pin_boxes.append((lon - 8 * pt_to_data_x, pin["lat"] - 5 * pt_to_data_y,
+                           lon + 60 * pt_to_data_x, pin["lat"] + 68 * pt_to_data_y))
+    placed_label_boxes.extend(pin_boxes)
 
     marine_to_check = marine
     if wrapped:
@@ -880,12 +932,15 @@ def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_p
         )
     draw_ocean_labels(ax, marine_to_check, view_box, placed_label_boxes, dpi, deg_per_px_x, deg_per_px_y)
 
-    draw_country_name_label(ax, country_geom, country_row, world_to_plot.columns,
-                             dpi, deg_per_px_x, deg_per_px_y, placed_label_boxes, avoid_points)
+    # Cities (the capital) are placed before the country name, not
+    # after — a city's position is fixed by geography, while the
+    # country name actively searches the whole landmass for open space,
+    # so it's the one that should route around a fixed label instead of
+    # the other way around.
     draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, placed_label_boxes)
+    draw_country_name_label(ax, country_geom, country_row, world_to_plot.columns,
+                             dpi, deg_per_px_x, deg_per_px_y, placed_label_boxes)
 
-    pt_to_data_x = dpi / 72.0 * deg_per_px_x
-    pt_to_data_y = dpi / 72.0 * deg_per_px_y
     # Beach names live in the legend only (see compose_poster), not on
     # the map itself — 5+ names crammed along a coastline never had
     # enough room to read well, however the labels dodged each other.
@@ -894,10 +949,6 @@ def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_p
     for pin in pins:
         lon = pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"]
         draw_diver_flag(ax, lon, pin["lat"], pin["number"])
-        # Reserve the flag icon's rough footprint so ocean/water labels
-        # don't land on top of it.
-        placed_label_boxes.append((lon - 8 * pt_to_data_x, pin["lat"] - 5 * pt_to_data_y,
-                                    lon + 60 * pt_to_data_x, pin["lat"] + 68 * pt_to_data_y))
 
     ax.set_xlim(minx, maxx)
     ax.set_ylim(miny, maxy)
@@ -1065,33 +1116,55 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     f_pin_num = load_font(34, bold=True)
     f_pin_name = load_font(38, bold=True)
 
-    def layout_key(font_num, font_name, r, row_h):
-        """Flows pins left-to-right, each taking only the width its own
-        name actually needs (not a fixed column width — beach names
-        vary a lot in length, and a fixed column was letting long names
-        run into the next entry). Wraps to a new row when an entry
-        would run past the right margin."""
-        x, y, entries, row_count = key_x0, 0, [], 1
-        for pin in pins:
-            text_w = draw.textlength(pin["name"], font=font_name)
-            entry_w = r * 2 + 16 + text_w + 60
-            if x + entry_w > key_x1 and x > key_x0:
-                x, y = key_x0, y + row_h
-                row_count += 1
-            entries.append((pin, x, y))
-            x += entry_w
-        return entries, row_count
+    def row_sizes(n, max_per_row):
+        """How many entries go in each row. A plain left-to-right fill
+        left an orphaned single entry stranded on its own row at the
+        end (e.g. 5 pins as 4-then-1) — lopsided instead of balanced.
+        Splitting into rows of at most `max_per_row` and, when there's
+        a leftover, tucking that shorter row into the *middle* of the
+        stack instead of the end reads as balanced/intentional (5 pins
+        becomes 2-1-2 — the same spread as the pips on a die)."""
+        full_rows, remainder = divmod(n, max_per_row)
+        sizes = [max_per_row] * full_rows
+        if remainder:
+            sizes.insert(len(sizes) // 2, remainder)
+        return sizes
+
+    def layout_key(font_num, font_name, r, row_h, max_per_row):
+        """Each row is centered horizontally, with every entry sized to
+        its own name's actual width (not a fixed column width — beach
+        names vary a lot in length)."""
+        sizes = row_sizes(len(pins), max_per_row)
+        entries, idx, y, max_row_w = [], 0, 0, 0
+        for size in sizes:
+            row_pins = pins[idx:idx + size]
+            idx += size
+            widths = [r * 2 + 16 + draw.textlength(p["name"], font=font_name) + 60 for p in row_pins]
+            row_w = sum(widths)
+            max_row_w = max(max_row_w, row_w)
+            x = key_x0 + max(0, (key_x1 - key_x0) - row_w) / 2
+            for p, w in zip(row_pins, widths):
+                entries.append((p, x, y))
+                x += w
+            y += row_h
+        return entries, len(sizes), max_row_w
 
     # Shrink only as much as needed if this particular map's pins don't
-    # all fit at full size within the section's height — most maps
-    # (5-ish pins) never hit this.
-    entries, row_count = layout_key(f_pin_num, f_pin_name, r, key_row_h)
-    while row_count * key_row_h > (key_y1 - key_y0) and key_row_h > 46:
+    # all fit at full size within the section — most maps (5-ish pins)
+    # never hit this. Two per row first (matches the balanced look
+    # above); if names are too long for that even at the smallest
+    # size, fall back to one per row rather than overflowing sideways.
+    max_per_row = 2
+    entries, row_count, max_row_w = layout_key(f_pin_num, f_pin_name, r, key_row_h, max_per_row)
+    while (row_count * key_row_h > (key_y1 - key_y0) or max_row_w > (key_x1 - key_x0)) and key_row_h > 46:
         key_row_h -= 6
         r = max(18, r - 3)
         f_pin_num = load_font(max(20, f_pin_num.size - 3), bold=True)
         f_pin_name = load_font(max(22, f_pin_name.size - 3), bold=True)
-        entries, row_count = layout_key(f_pin_num, f_pin_name, r, key_row_h)
+        entries, row_count, max_row_w = layout_key(f_pin_num, f_pin_name, r, key_row_h, max_per_row)
+    if max_row_w > (key_x1 - key_x0) and max_per_row > 1:
+        max_per_row = 1
+        entries, row_count, max_row_w = layout_key(f_pin_num, f_pin_name, r, key_row_h, max_per_row)
 
     for pin, ex, ey in entries:
         cx, cy = ex + r, key_y0 + ey + r
