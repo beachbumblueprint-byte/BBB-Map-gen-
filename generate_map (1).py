@@ -100,23 +100,21 @@ BRAND = {
                                         # isn't available to pick a palette color
 }
 
-# Each non-featured country gets its own color from this set (picked
+# Each non-featured country gets its own shade from this set (picked
 # deterministically per country name) instead of one flat fill, so
-# neighboring countries are never the same color as each other and the
-# map doesn't read as a flat, muted block. Lighter/softer than a typical
-# jewel-tone palette on purpose — dark navy label text sits directly on
-# these with no outline, so they need enough headroom to stay legible;
-# no purple/indigo (didn't land well) and nothing that competes with
-# the featured country's green.
+# neighboring countries are never the same shade as each other. Narrowed
+# down to one cohesive brown/tan family on purpose — a full rainbow of
+# unrelated hues was reading as "too many colors to pick"; keeping the
+# supporting cast in one earth-tone family lets the featured country's
+# green stand out as the one clearly different color on the page, and
+# dark navy label text (no outline) stays legible on all of these.
 NEIGHBOR_PALETTE = [
-    "#5FBBAF",  # soft teal
-    "#E3AE58",  # warm gold
-    "#DB9678",  # terracotta
-    "#D19BAC",  # dusty rose
-    "#84AECD",  # soft blue (not purple)
-    "#C39A66",  # caramel tan
-    "#A7B078",  # soft sage
-    "#B6A0A3",  # warm mauve gray
+    "#B98858",  # warm tan
+    "#8B6F47",  # medium brown
+    "#C9A66B",  # sandy tan
+    "#A67B5B",  # terracotta-brown
+    "#D4B483",  # pale gold-tan
+    "#7A6142",  # deep umber
 ]
 
 
@@ -604,11 +602,11 @@ def draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, place
             continue
         lon = city["lon"] + 360 if (wrapped and city["lon"] < 0) else city["lon"]
         marker = "*" if city["is_capital"] else "o"
-        size = 20 if city["is_capital"] else 10
+        size = 24 if city["is_capital"] else 12
         ax.plot(lon, city["lat"], marker, markersize=size,
                  color=hex_of("navy_header"), markeredgecolor="white",
                  markeredgewidth=1.2, zorder=7)
-        fontsize = 14
+        fontsize = 18
         label_text = f"  {city['name']}"
         placed_boxes.append(label_footprint(lon, city["lat"], label_text, fontsize, dpi,
                                              deg_per_px_x, deg_per_px_y, ha="left"))
@@ -624,9 +622,9 @@ def draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, place
 # of each other. Two distance tiers (near, then farther) so a label can
 # hop clear of a crowded cluster instead of only rotating in place.
 LABEL_OFFSET_CANDIDATES = [
-    (16, 0), (16, 14), (16, -14), (-16, 0), (-16, 14), (-16, -14), (0, 20), (0, -20),
-    (30, 0), (30, 22), (30, -22), (-30, 0), (-30, 22), (-30, -22), (0, 34), (0, -34),
-    (42, 10), (42, -10), (-42, 10), (-42, -10),
+    (20, 0), (20, 18), (20, -18), (-20, 0), (-20, 18), (-20, -18), (0, 26), (0, -26),
+    (38, 0), (38, 28), (38, -28), (-38, 0), (-38, 28), (-38, -28), (0, 44), (0, -44),
+    (54, 13), (54, -13), (-54, 13), (-54, -13),
 ]
 
 
@@ -763,9 +761,12 @@ def draw_country_gradient_fill(ax, geometry, base_hex, zorder=1):
     base_rgb = tuple(int(base_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
     # LinearSegmentedColormap wants 0-1 floats, not 0-255 ints — every
     # channel was clamping to 1.0 (white) without this conversion.
+    # Kept subtle on purpose: label text sits directly on this fill with
+    # no outline, so contrast needs to stay roughly consistent wherever
+    # a label happens to land, not swing from light to dark across it.
     to_unit = lambda rgb: tuple(c / 255 for c in rgb)
     cmap = LinearSegmentedColormap.from_list(
-        "shade", [to_unit(darken(base_rgb, 0.22)), to_unit(lighten(base_rgb, 0.30))])
+        "shade", [to_unit(darken(base_rgb, 0.12)), to_unit(lighten(base_rgb, 0.14))])
     grad = np.linspace(0, 1, 256).reshape(256, 1)
     gminx, gminy, gmaxx, gmaxy = geometry.bounds
     im = ax.imshow(grad, extent=(gminx, gmaxx, gminy, gmaxy), origin="lower",
@@ -855,11 +856,11 @@ def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_p
         # labels don't get placed underneath it.
         placed_label_boxes.append((lon - 8 * pt_to_data_x, pin["lat"] - 5 * pt_to_data_y,
                                     lon + 60 * pt_to_data_x, pin["lat"] + 68 * pt_to_data_y))
-        dx_pt, dy_pt, ha = place_label(lon, pin["lat"], pin["name"], 14, dpi,
+        dx_pt, dy_pt, ha = place_label(lon, pin["lat"], pin["name"], 18, dpi,
                                         deg_per_px_x, deg_per_px_y, placed_label_boxes)
         ax.annotate(pin["name"], xy=(lon, pin["lat"]), xytext=(dx_pt, dy_pt),
                      textcoords="offset points", ha=ha, va="center",
-                     color=hex_of("text_dark"), fontsize=14, fontweight="bold", zorder=10)
+                     color=hex_of("text_dark"), fontsize=18, fontweight="bold", zorder=10)
 
     ax.set_xlim(minx, maxx)
     ax.set_ylim(miny, maxy)
