@@ -477,7 +477,12 @@ def draw_ocean_labels(ax, marine, view_box, placed_boxes, dpi, deg_per_px_x, deg
     Pacific Ocean, Caribbean Sea) — orients viewers without a separate
     atlas, same idea as the neighbor-country labels but for water.
     Italicized and in the brand's ocean blue to read as clearly
-    different from land labels."""
+    different from land labels. Tries several points around each water
+    body's representative point (not just that one spot) and falls
+    back to the least-bad option rather than dropping the label
+    outright — a big, important water body missing entirely because its
+    one candidate point landed in a reserved zone is worse than a label
+    that's slightly imperfectly placed."""
     if "name" not in marine.columns:
         return
     view_area = view_box.area
@@ -488,21 +493,38 @@ def draw_ocean_labels(ax, marine, view_box, placed_boxes, dpi, deg_per_px_x, deg
         clipped = row.geometry.intersection(view_box)
         if clipped.is_empty or clipped.area < view_area * 0.01:
             continue
-        candidates.append((clipped.area, row["name"], clipped.representative_point()))
+        candidates.append((clipped.area, row["name"], clipped))
     candidates.sort(key=lambda c: c[0], reverse=True)
     minx, miny, maxx, maxy = view_box.bounds
+    dx, dy = (maxx - minx) * 0.10, (maxy - miny) * 0.10
     fontsize = 26
     placed = 0
-    for _, name, point in candidates:
+    for _, name, geom in candidates:
         if placed >= max_labels:
             break
-        box = label_footprint(point.x, point.y, name, fontsize, dpi, deg_per_px_x, deg_per_px_y, ha="center")
-        if box[0] < minx or box[2] > maxx or box[1] < miny or box[3] > maxy:
-            continue  # would run off the edge of the frame
-        if any(boxes_overlap(box, pb) for pb in placed_boxes):
-            continue
-        placed_boxes.append(box)
-        ax.text(point.x, point.y, name, color="black", fontsize=fontsize,
+        base = geom.representative_point()
+        jitter_points = [
+            base,
+            Point(base.x, min(maxy, base.y + dy)), Point(base.x, max(miny, base.y - dy)),
+            Point(min(maxx, base.x + dx), base.y), Point(max(minx, base.x - dx), base.y),
+            Point(min(maxx, base.x + dx), min(maxy, base.y + dy)),
+            Point(max(minx, base.x - dx), max(miny, base.y - dy)),
+        ]
+        best = None
+        for p in jitter_points:
+            box = label_footprint(p.x, p.y, name, fontsize, dpi, deg_per_px_x, deg_per_px_y, ha="center")
+            if box[0] < minx or box[2] > maxx or box[1] < miny or box[3] > maxy:
+                continue
+            overlap = sum(overlap_area(box, pb) for pb in placed_boxes)
+            if overlap == 0:
+                best = (0, p, box)
+                break
+            if best is None or overlap < best[0]:
+                best = (overlap, p, box)
+        if best is None:
+            continue  # every candidate point ran off the frame edge
+        placed_boxes.append(best[2])
+        ax.text(best[1].x, best[1].y, name, color="black", fontsize=fontsize,
                  fontweight="bold", fontstyle="italic", ha="center", va="center", zorder=2)
         placed += 1
 
@@ -588,7 +610,7 @@ def draw_country_name_label(ax, country_geom, country_row, columns, dpi,
         return
     name = country_row[name_col]
     avoid_boxes = avoid_boxes_for(avoid_points, dpi, deg_per_px_x, deg_per_px_y)
-    point, fontsize = find_open_space_point(country_geom, name, 32, dpi,
+    point, fontsize = find_open_space_point(country_geom, name, 46, dpi,
                                              deg_per_px_x, deg_per_px_y, avoid_boxes)
     placed_boxes.append(label_footprint(point.x, point.y, name, fontsize, dpi,
                                          deg_per_px_x, deg_per_px_y, ha="center"))
@@ -636,19 +658,45 @@ def overlap_area(a, b):
     return ox * oy
 
 
-def place_label(lon, lat, text, fontsize, dpi, deg_per_px_x, deg_per_px_y, placed_boxes):
-    """Picks the offset (from LABEL_OFFSET_CANDIDATES) whose estimated
-    label footprint doesn't overlap a previously placed label, working in
-    data (lon/lat) coordinates converted from the view's pixel scale. If
-    every candidate collides with something (a crowded cluster), falls
-    back to whichever candidate overlaps the least instead of always
+_NEAR_TIER = LABEL_OFFSET_CANDIDATES[0:8]
+_MID_TIER = LABEL_OFFSET_CANDIDATES[8:16]
+_FAR_TIER = LABEL_OFFSET_CANDIDATES[16:20]
+
+
+def ordered_label_candidates(prefer_dir):
+    """Candidate offsets, nearest-tier-first as usual, but within each
+    tier sorted so whichever offset points most toward prefer_dir (e.g.
+    away from the country's landmass, out over open water) is tried
+    first — coastal beach names default to hugging the coastline
+    otherwise, which is exactly what's too cramped to read."""
+    if prefer_dir is None:
+        return LABEL_OFFSET_CANDIDATES
+    pdx, pdy = prefer_dir
+    pnorm = (pdx ** 2 + pdy ** 2) ** 0.5 or 1
+    pdx, pdy = pdx / pnorm, pdy / pnorm
+
+    def align_key(c):
+        cx, cy = c
+        cn = (cx ** 2 + cy ** 2) ** 0.5 or 1
+        return -(pdx * cx / cn + pdy * cy / cn)
+
+    return sorted(_NEAR_TIER, key=align_key) + sorted(_MID_TIER, key=align_key) + sorted(_FAR_TIER, key=align_key)
+
+
+def place_label(lon, lat, text, fontsize, dpi, deg_per_px_x, deg_per_px_y, placed_boxes, prefer_dir=None):
+    """Picks the offset (from LABEL_OFFSET_CANDIDATES, optionally
+    reordered by prefer_dir) whose estimated label footprint doesn't
+    overlap a previously placed label, working in data (lon/lat)
+    coordinates converted from the view's pixel scale. If every
+    candidate collides with something (a crowded cluster), falls back
+    to whichever candidate overlaps the least instead of always
     reusing the first (guaranteed-worst) one."""
     pt_to_data_x = deg_per_px_x * dpi / 72.0
     pt_to_data_y = deg_per_px_y * dpi / 72.0
     w = fontsize * 0.62 * (dpi / 72.0) * len(text) * deg_per_px_x
     h = fontsize * 1.3 * (dpi / 72.0) * deg_per_px_y
     best = None  # (total_overlap, dx_pt, dy_pt, ha, box)
-    for dx_pt, dy_pt in LABEL_OFFSET_CANDIDATES:
+    for dx_pt, dy_pt in ordered_label_candidates(prefer_dir):
         dx, dy = dx_pt * pt_to_data_x, dy_pt * pt_to_data_y
         ha = "left" if dx_pt >= 0 else "right"
         box = (lon + dx, lat + dy - h / 2, lon + dx + w, lat + dy + h / 2) if ha == "left" \
@@ -828,6 +876,18 @@ def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_p
     deg_per_px_y = (maxy - miny) / target_h_px
     placed_label_boxes = []
 
+    avoid_points = []
+    for city in cities:
+        avoid_points.append((city["lon"] + 360 if (wrapped and city["lon"] < 0) else city["lon"], city["lat"]))
+    for pin in pins:
+        avoid_points.append((pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"], pin["lat"]))
+
+    # Reserve space around the beach pins *before* placing the ocean/sea
+    # labels, so a big label like "North Pacific Ocean" actively steers
+    # clear of the pin cluster instead of just landing wherever the
+    # water body's biggest visible area happens to be.
+    placed_label_boxes.extend(avoid_boxes_for(avoid_points, dpi, deg_per_px_x, deg_per_px_y, pad_pt=35))
+
     marine_to_check = marine
     if wrapped:
         marine_to_check = marine.copy()
@@ -836,18 +896,13 @@ def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_p
         )
     draw_ocean_labels(ax, marine_to_check, view_box, placed_label_boxes, dpi, deg_per_px_x, deg_per_px_y)
 
-    avoid_points = []
-    for city in cities:
-        avoid_points.append((city["lon"] + 360 if (wrapped and city["lon"] < 0) else city["lon"], city["lat"]))
-    for pin in pins:
-        avoid_points.append((pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"], pin["lat"]))
-
     draw_country_name_label(ax, country_geom, country_row, world_to_plot.columns,
                              dpi, deg_per_px_x, deg_per_px_y, placed_label_boxes, avoid_points)
     draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, placed_label_boxes)
 
     pt_to_data_x = dpi / 72.0 * deg_per_px_x
     pt_to_data_y = dpi / 72.0 * deg_per_px_y
+    country_center = country_geom.centroid
     for pin in pins:
         lon = pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"]
         draw_diver_flag(ax, lon, pin["lat"], pin["number"])
@@ -856,8 +911,12 @@ def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_p
         # labels don't get placed underneath it.
         placed_label_boxes.append((lon - 8 * pt_to_data_x, pin["lat"] - 5 * pt_to_data_y,
                                     lon + 60 * pt_to_data_x, pin["lat"] + 68 * pt_to_data_y))
+        # Prefer placing the name away from the country's center — for a
+        # coastal pin that means drifting out over open water instead of
+        # defaulting to hugging the cramped coastline.
+        prefer_dir = (lon - country_center.x, pin["lat"] - country_center.y)
         dx_pt, dy_pt, ha = place_label(lon, pin["lat"], pin["name"], 18, dpi,
-                                        deg_per_px_x, deg_per_px_y, placed_label_boxes)
+                                        deg_per_px_x, deg_per_px_y, placed_label_boxes, prefer_dir)
         ax.annotate(pin["name"], xy=(lon, pin["lat"]), xytext=(dx_pt, dy_pt),
                      textcoords="offset points", ha=ha, va="center",
                      color=hex_of("text_dark"), fontsize=18, fontweight="bold", zorder=10)
@@ -1053,22 +1112,26 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
 
     # Beach pin key, bottom-left overlay on the map — wraps into another
     # column instead of running off the map when there are many pins.
+    # Sized big — this is the legend for the entire point of the map
+    # (which beach is which number), so it can't be the part that's
+    # hard to read.
     key_x0, key_y0 = 30, map_y0 + 20
-    key_col_w = 280
+    key_col_w = 440
+    key_row_h = 52
     key_y_max = map_y1 - 20
     key_x, key_y = key_x0, key_y0
-    f_pin_num = load_font(16, bold=True)
-    f_pin_name = load_font(18)
+    f_pin_num = load_font(24, bold=True)
+    f_pin_name = load_font(28, bold=True)
     for pin in pins:
-        if key_y + 32 > key_y_max:
+        if key_y + key_row_h > key_y_max:
             key_x += key_col_w
             key_y = key_y0
-        cx, cy, r = key_x + 12, key_y + 12, 13
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=rgb("brick_red"), outline=rgb("white"), width=2)
+        cx, cy, r = key_x + 20, key_y + 20, 21
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=rgb("brick_red"), outline=rgb("white"), width=3)
         num_w = draw.textlength(str(pin["number"]), font=f_pin_num)
-        draw.text((cx - num_w / 2, cy - 9), str(pin["number"]), font=f_pin_num, fill=rgb("white"))
-        draw.text((key_x + 34, key_y + 2), pin["name"], font=f_pin_name, fill=rgb("text_dark"))
-        key_y += 32
+        draw.text((cx - num_w / 2, cy - 15), str(pin["number"]), font=f_pin_num, fill=rgb("white"))
+        draw.text((key_x + 50, key_y + 6), pin["name"], font=f_pin_name, fill=rgb("text_dark"))
+        key_y += key_row_h
 
     # ---- Footer bar ---- same treatment as the header: big, bold, white
     # — legible on a phone screen scaled way down, not just at full size.
