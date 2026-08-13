@@ -36,7 +36,6 @@ import os
 import subprocess
 import sys
 import time
-import textwrap
 import zlib
 
 # ---------------------------------------------------------------------
@@ -124,9 +123,13 @@ def neighbor_color_for(name) -> str:
 CANVAS_W, CANVAS_H = 2400, 1600
 HEADER_H = 112             # tall enough for genuinely large corner text —
 FOOTER_H = 92               # this is meant to be viewed on a phone screen
-TOP_STRIP_H = 340          # flag + name + facts strip, full width
+TOP_STRIP_H = 340          # flag + name + artwork strip, full width
 FLAG_BOX_W, FLAG_BOX_H = 380, 240  # most flags share a similar aspect ratio,
                                     # so a bigger fixed box is safe to standardize on
+
+ARTWORK_PATH = os.path.join(os.path.dirname(__file__), "assets", "bbb_logo.png")
+ARTWORK_BOX_W, ARTWORK_BOX_H = 360, 170  # brand artwork under the country name,
+                                          # same fixed-box treatment as the flag
 
 # Locator box, top-right corner of the top strip. Sized to the real
 # aspect ratio of its world view (see LOCATOR_LAT_MIN/MAX below) so the
@@ -967,36 +970,18 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     # still render on top of it instead of getting cut by it.
     draw.rectangle([0, strip_y0, CANVAS_W - 1, strip_y1], outline=rgb("navy_header"), width=5)
 
-    # Country name and facts columns start at a fixed x — computed first
-    # so the flag (below) can be centered against where this text
-    # *actually* renders, not a guessed column width. Both the title and
-    # the facts block are themselves centered within this column, so
-    # their real left edge is well right of name_x.
+    # Country name column starts at a fixed x — computed first so the
+    # flag (below) can be centered against where this text *actually*
+    # renders, not a guessed column width. The title is itself centered
+    # within this column, so its real left edge is well right of name_x.
     name_x = 520
     name_max_w = CANVAS_W - LOCATOR_W - name_x - 40
     f_title = autosize_font(draw, country_name.upper(), name_max_w, start_size=72, min_size=32)
     title_w = draw.textlength(country_name.upper(), font=f_title)
     title_x = name_x + (name_max_w - title_w) / 2
 
-    f_label = load_font(30, bold=True)
-    f_value = load_font(28)
-    facts_list = [
-        ("Capital", facts["capital"]),
-        ("Language", facts["language"]),
-        ("Currency", facts["currency"]),
-        ("Climate", facts["climate"]),
-    ]
-    wrapped_values = [textwrap.shorten(v, width=30, placeholder="...") for _, v in facts_list]
-    col_content_w = max(
-        max(draw.textlength(f"{l}:", font=f_label) for l, _ in facts_list),
-        max(draw.textlength(v, font=f_value) for v in wrapped_values),
-    )
-    col_gutter = 70
-    col_w = col_content_w + col_gutter
-    facts_block_x = name_x + (name_max_w - (col_w * 2 - col_gutter)) / 2
-
     # Flag — fit, never stretched, uniform frame. Centered between the
-    # left edge of the poster and wherever the title/facts text actually
+    # left edge of the poster and wherever the title text actually
     # starts (not a fixed guess), and sized generously since most flags
     # share a similar aspect ratio.
     try:
@@ -1005,8 +990,7 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     except Exception as e:
         print(f"  Warning: could not load flag ({e}) — using placeholder.")
         flag_fitted = placeholder_flag(FLAG_BOX_W, FLAG_BOX_H)
-    text_left_edge = min(title_x, facts_block_x)
-    flag_x = max(20, int((text_left_edge - FLAG_BOX_W) / 2))
+    flag_x = max(20, int((title_x - FLAG_BOX_W) / 2))
     flag_y = int(strip_y0 + (TOP_STRIP_H - FLAG_BOX_H) / 2)
     draw.rectangle([flag_x - 4, flag_y - 4, flag_x + FLAG_BOX_W + 4, flag_y + FLAG_BOX_H + 4],
                     outline=rgb("ocean_blue"), width=3)
@@ -1014,15 +998,13 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
 
     draw.text((title_x, strip_y0 + 40), country_name.upper(), font=f_title, fill=rgb("text_dark"))
 
-    # Facts strip — Capital / Language / Currency / Climate only
-    facts_y = strip_y0 + 145
-    for i, (label_text, value_text) in enumerate(facts_list):
-        col = i % 2
-        row = i // 2
-        fx = facts_block_x + col * col_w
-        fy = facts_y + row * 100
-        draw.text((fx, fy), f"{label_text}:", font=f_label, fill=rgb("ocean_blue"))
-        draw.text((fx, fy + 40), wrapped_values[i], font=f_value, fill=rgb("text_dark"))
+    # Brand artwork — fixed box, same fit/center treatment as the flag,
+    # placed under the title in place of the old facts block.
+    if os.path.exists(ARTWORK_PATH):
+        artwork_fitted = fit_image_in_box(Image.open(ARTWORK_PATH).convert("RGBA"), ARTWORK_BOX_W, ARTWORK_BOX_H)
+        artwork_x = int(name_x + (name_max_w - ARTWORK_BOX_W) / 2)
+        artwork_y = strip_y0 + 160
+        canvas.paste(artwork_fitted, (artwork_x, artwork_y), artwork_fitted)
 
     # Locator — top right corner of the strip. Sized to its true aspect
     # ratio (see LOCATOR_H) so it fills the box with no letterboxing,
