@@ -124,8 +124,8 @@ def neighbor_color_for(name) -> str:
     return NEIGHBOR_PALETTE[zlib.crc32(str(name).encode("utf-8")) % len(NEIGHBOR_PALETTE)]
 
 CANVAS_W, CANVAS_H = 2400, 1600
-HEADER_H = 90
-FOOTER_H = 70
+HEADER_H = 112             # tall enough for genuinely large corner text —
+FOOTER_H = 92               # this is meant to be viewed on a phone screen
 TOP_STRIP_H = 340          # flag + name + facts strip, full width
 FLAG_BOX_W, FLAG_BOX_H = 300, 190
 
@@ -895,16 +895,19 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     draw = ImageDraw.Draw(canvas)
 
     # ---- Header bar ---- website is the headline (that's the brand
-    # we're selling); the map-series label is small print on the right.
+    # we're selling); the map-series label is smaller print on the
+    # right. This poster is viewed on phone screens, scaled way down —
+    # these corner texts need to survive that, so they're sized to
+    # fill most of the bar height, not just "readable at full size."
     # All four corners of the poster (this bar + the footer) use the
     # same gold accent for their text, consistently.
     draw.rectangle([0, 0, CANVAS_W, HEADER_H], fill=rgb("navy_header"))
-    f_header = load_font(34, bold=True)
-    f_header_small = load_font(20, bold=True)
-    draw.text((30, 25), WEBSITE.upper(), font=f_header, fill=rgb("gold_accent"))
+    f_header = load_font(56, bold=True)
+    f_header_small = load_font(32, bold=True)
+    draw.text((30, (HEADER_H - 56) / 2 - 6), WEBSITE.upper(), font=f_header, fill=rgb("gold_accent"))
     label = "BEACH BUM BLUEPRINT MAP SERIES"
     w = draw.textlength(label, font=f_header_small)
-    draw.text((CANVAS_W - w - 30, 35), label, font=f_header_small, fill=rgb("gold_accent"))
+    draw.text((CANVAS_W - w - 30, (HEADER_H - 32) / 2 - 2), label, font=f_header_small, fill=rgb("gold_accent"))
 
     # ---- Top strip: flag, name, facts (left) + locator (right) ----
     strip_y0 = HEADER_H
@@ -1004,14 +1007,18 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
         draw.text((key_x + 34, key_y + 2), pin["name"], font=f_pin_name, fill=rgb("text_dark"))
         key_y += 32
 
-    # ---- Footer bar ---- same treatment as the header: the contact
-    # info is the important part, so it gets the bold gold accent
-    # instead of plain white fading into the navy.
+    # ---- Footer bar ---- same treatment as the header: big, bold, gold
+    # — legible on a phone screen scaled way down, not just at full size.
     draw.rectangle([0, CANVAS_H - FOOTER_H, CANVAS_W, CANVAS_H], fill=rgb("navy_header"))
-    f_footer_contact = load_font(24, bold=True)
-    draw.text((30, CANVAS_H - FOOTER_H + 20), TAGLINE, font=load_font(24, bold=True), fill=rgb("gold_accent"))
+    footer_half_w = CANVAS_W / 2 - 50
+    f_footer_tagline = autosize_font(draw, TAGLINE, footer_half_w, start_size=40, bold=True, min_size=22)
+    f_footer_contact = load_font(38, bold=True)
+    tagline_h = f_footer_tagline.getbbox(TAGLINE)[3]
+    draw.text((30, (CANVAS_H - FOOTER_H) + (FOOTER_H - tagline_h) / 2), TAGLINE,
+              font=f_footer_tagline, fill=rgb("gold_accent"))
     w = draw.textlength(CONTACT_EMAIL, font=f_footer_contact)
-    draw.text((CANVAS_W - w - 30, CANVAS_H - FOOTER_H + 20), CONTACT_EMAIL,
+    contact_h = f_footer_contact.getbbox(CONTACT_EMAIL)[3]
+    draw.text((CANVAS_W - w - 30, (CANVAS_H - FOOTER_H) + (FOOTER_H - contact_h) / 2), CONTACT_EMAIL,
               font=f_footer_contact, fill=rgb("gold_accent"))
 
     canvas.save(out_path, "PNG")
