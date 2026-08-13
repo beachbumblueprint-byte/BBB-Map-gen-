@@ -87,7 +87,10 @@ BRAND = {
     "palm_green": (62, 142, 90),
     "aqua": (44, 184, 174),
     "brick_red": (192, 59, 43),
-    "sand": (245, 240, 224),
+    "sand": (236, 220, 180),        # clearly tan, not a near-white
+    "sand_deep": (216, 194, 143),   # darker end of the top-strip gradient
+    "gold_accent": (250, 194, 61),  # high-contrast headline color on navy —
+                                     # aqua read as blue-on-blue and blended in
     "white": (255, 255, 255),
     "text_dark": (30, 30, 30),
     "highlight_land": (61, 168, 99),   # the featured country's fill — a bold,
@@ -138,6 +141,7 @@ MAX_CITY_LABELS = 1  # capital only — keep the map simple
 
 TAGLINE = "Live Well.  Retire Happy.  Life's Better by the Beach."
 WEBSITE = "www.beachbumblueprint.com"
+CONTACT_EMAIL = "beachbumblueprint@gmail.com"
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -465,9 +469,8 @@ def draw_neighbor_labels(ax, world_to_plot, country_idx, view_box):
         candidates.append((clipped.area, row[name_col], clipped.representative_point()))
     candidates.sort(key=lambda c: c[0], reverse=True)
     for _, name, point in candidates[:6]:
-        txt = ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=26,
-                       fontweight="bold", ha="center", va="center", zorder=3)
-        txt.set_path_effects([pe.withStroke(linewidth=6, foreground="white")])
+        ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=26,
+                 fontweight="bold", ha="center", va="center", zorder=3)
 
 
 def draw_ocean_labels(ax, marine, view_box, placed_boxes, dpi, deg_per_px_x, deg_per_px_y, max_labels=3):
@@ -500,9 +503,8 @@ def draw_ocean_labels(ax, marine, view_box, placed_boxes, dpi, deg_per_px_x, deg
         if any(boxes_overlap(box, pb) for pb in placed_boxes):
             continue
         placed_boxes.append(box)
-        txt = ax.text(point.x, point.y, name, color=hex_of("ocean_blue"), fontsize=fontsize,
-                       fontweight="bold", fontstyle="italic", ha="center", va="center", zorder=2)
-        txt.set_path_effects([pe.withStroke(linewidth=6, foreground="white")])
+        ax.text(point.x, point.y, name, color=hex_of("ocean_blue"), fontsize=fontsize,
+                 fontweight="bold", fontstyle="italic", ha="center", va="center", zorder=2)
         placed += 1
 
 
@@ -591,9 +593,8 @@ def draw_country_name_label(ax, country_geom, country_row, columns, dpi,
                                              deg_per_px_x, deg_per_px_y, avoid_boxes)
     placed_boxes.append(label_footprint(point.x, point.y, name, fontsize, dpi,
                                          deg_per_px_x, deg_per_px_y, ha="center"))
-    txt = ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=fontsize,
-                   fontweight="bold", ha="center", va="center", zorder=6)
-    txt.set_path_effects([pe.withStroke(linewidth=5, foreground="white")])
+    ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=fontsize,
+             fontweight="bold", ha="center", va="center", zorder=6)
 
 
 def draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, placed_boxes):
@@ -880,6 +881,15 @@ def rgb(name):
     return BRAND[name][:3]
 
 
+def make_vertical_gradient(w, h, color_a, color_b):
+    """Simple top-to-bottom linear gradient — same idea as the ocean's
+    depth shading, applied to a big flat-colored panel so it reads as
+    intentional shading instead of one flat block."""
+    row = np.linspace(0, 1, h).reshape(h, 1, 1)
+    arr = np.array(color_a) + (np.array(color_b) - np.array(color_a)) * row
+    return Image.fromarray(arr.astype(np.uint8), "RGB").resize((w, h))
+
+
 def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_path):
     canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), rgb("white"))
     draw = ImageDraw.Draw(canvas)
@@ -889,7 +899,7 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     draw.rectangle([0, 0, CANVAS_W, HEADER_H], fill=rgb("navy_header"))
     f_header = load_font(34, bold=True)
     f_header_small = load_font(20, bold=True)
-    draw.text((30, 25), WEBSITE.upper(), font=f_header, fill=rgb("aqua"))
+    draw.text((30, 25), WEBSITE.upper(), font=f_header, fill=rgb("gold_accent"))
     label = "BEACH BUM BLUEPRINT MAP SERIES"
     w = draw.textlength(label, font=f_header_small)
     draw.text((CANVAS_W - w - 30, 35), label, font=f_header_small, fill=rgb("white"))
@@ -897,7 +907,8 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     # ---- Top strip: flag, name, facts (left) + locator (right) ----
     strip_y0 = HEADER_H
     strip_y1 = HEADER_H + TOP_STRIP_H
-    draw.rectangle([0, strip_y0, CANVAS_W, strip_y1], fill=rgb("sand"))
+    strip_gradient = make_vertical_gradient(CANVAS_W, TOP_STRIP_H, rgb("sand"), rgb("sand_deep"))
+    canvas.paste(strip_gradient, (0, strip_y0))
     # Frame it so the sand panel reads as its own zone instead of
     # blending into the map's similarly pale land color right below it.
     # Drawn now, before any strip content, so labels that slightly
@@ -991,12 +1002,15 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
         draw.text((key_x + 34, key_y + 2), pin["name"], font=f_pin_name, fill=rgb("text_dark"))
         key_y += 32
 
-    # ---- Footer bar ----
+    # ---- Footer bar ---- same treatment as the header: the contact
+    # info is the important part, so it gets the bold gold accent
+    # instead of plain white fading into the navy.
     draw.rectangle([0, CANVAS_H - FOOTER_H, CANVAS_W, CANVAS_H], fill=rgb("navy_header"))
-    f_footer = load_font(20, bold=True)
-    draw.text((30, CANVAS_H - FOOTER_H + 22), TAGLINE, font=load_font(16), fill=rgb("white"))
-    w = draw.textlength(WEBSITE, font=f_footer)
-    draw.text((CANVAS_W - w - 30, CANVAS_H - FOOTER_H + 22), WEBSITE, font=f_footer, fill=rgb("white"))
+    f_footer_contact = load_font(24, bold=True)
+    draw.text((30, CANVAS_H - FOOTER_H + 22), TAGLINE, font=load_font(19, bold=True), fill=rgb("white"))
+    w = draw.textlength(CONTACT_EMAIL, font=f_footer_contact)
+    draw.text((CANVAS_W - w - 30, CANVAS_H - FOOTER_H + 20), CONTACT_EMAIL,
+              font=f_footer_contact, fill=rgb("gold_accent"))
 
     canvas.save(out_path, "PNG")
 
