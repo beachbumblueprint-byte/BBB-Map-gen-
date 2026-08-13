@@ -120,16 +120,30 @@ NEIGHBOR_PALETTE = [
 def neighbor_color_for(name) -> str:
     return NEIGHBOR_PALETTE[zlib.crc32(str(name).encode("utf-8")) % len(NEIGHBOR_PALETTE)]
 
+
+def adaptive_text_color(bg_hex: str) -> str:
+    """Picks dark-navy or white label text depending on the actual
+    brightness of the specific background it's sitting on — the
+    neighbor palette spans light tans through dark umber, and a single
+    fixed text color reads fine on some of those and badly on others."""
+    r, g, b = (int(bg_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    return hex_of("navy_header") if luminance > 140 else "#ffffff"
+
+
 CANVAS_W, CANVAS_H = 2400, 1600
 HEADER_H = 112             # tall enough for genuinely large corner text —
 FOOTER_H = 92               # this is meant to be viewed on a phone screen
-TOP_STRIP_H = 340          # flag + name + artwork strip, full width
+TOP_STRIP_H = 420          # flag + name + artwork strip, full width — grown
+                            # to give the artwork real room instead of
+                            # squeezing it under the title
 FLAG_BOX_W, FLAG_BOX_H = 380, 240  # most flags share a similar aspect ratio,
                                     # so a bigger fixed box is safe to standardize on
 
 ARTWORK_PATH = os.path.join(os.path.dirname(__file__), "assets", "bbb_logo.png")
-ARTWORK_BOX_W, ARTWORK_BOX_H = 360, 170  # brand artwork under the country name,
-                                          # same fixed-box treatment as the flag
+ARTWORK_BOX_W, ARTWORK_BOX_H = 420, 270  # brand artwork under the country name,
+                                          # same fixed-box treatment as the flag —
+                                          # as big as the strip's remaining height allows
 
 # Locator box, top-right corner of the top strip. Sized to the real
 # aspect ratio of its world view (see LOCATOR_LAT_MIN/MAX below) so the
@@ -471,7 +485,8 @@ def draw_neighbor_labels(ax, world_to_plot, country_idx, view_box):
         candidates.append((clipped.area, row[name_col], clipped.representative_point()))
     candidates.sort(key=lambda c: c[0], reverse=True)
     for _, name, point in candidates[:6]:
-        ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=26,
+        text_color = adaptive_text_color(neighbor_color_for(name))
+        ax.text(point.x, point.y, name, color=text_color, fontsize=34,
                  fontweight="bold", ha="center", va="center", zorder=3, clip_on=True)
 
 
@@ -503,7 +518,7 @@ def draw_ocean_labels(ax, marine, view_box, placed_boxes, dpi, deg_per_px_x, deg
     for _, name, geom in candidates:
         if placed >= max_labels:
             break
-        point, fontsize, fit_ok = find_open_space_point(geom, name, 28, dpi, deg_per_px_x, deg_per_px_y,
+        point, fontsize, fit_ok = find_open_space_point(geom, name, 38, dpi, deg_per_px_x, deg_per_px_y,
                                                           placed_boxes, grid_n=45, min_size_frac=0.6)
         if not fit_ok:
             continue  # no clean spot for this one — skip it rather than show a cramped/cut-off label
@@ -714,7 +729,12 @@ def draw_ocean_depth_shading(ax, land_union, minx, miny, maxx, maxy, grid_n=90):
         for i, x in enumerate(xs):
             grid[j, i] = min(land_union.distance(Point(x, y)) / max_dist, 1.0)
     cmap = LinearSegmentedColormap.from_list("depth", [hex_of("ocean_light"), hex_of("ocean_blue")])
-    ax.imshow(grid, extent=(minx, maxx, miny, maxy), origin="lower", cmap=cmap,
+    # Extent padded slightly past the actual view bounds — imshow's pixel
+    # grid can leave a hairline gap at the exact edge otherwise, letting
+    # the axes' own (much paler) fallback facecolor show through as a
+    # thin light-blue seam down the left/right sides.
+    pad_x, pad_y = (maxx - minx) * 0.01, (maxy - miny) * 0.01
+    ax.imshow(grid, extent=(minx - pad_x, maxx + pad_x, miny - pad_y, maxy + pad_y), origin="lower", cmap=cmap,
               zorder=0, aspect="auto", interpolation="bilinear")
 
 
@@ -765,7 +785,12 @@ def draw_country_gradient_fill(ax, geometry, base_hex, zorder=1):
 
 def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_px, target_h_px):
     dpi = 150
-    ocean = hex_of("ocean_light")
+    # Fallback facecolor is the *dark* end of the depth-shading gradient,
+    # not the light end — any hairline gap between the gradient imshow
+    # and the true axes edge shows this color, and it needs to blend
+    # with the (mostly darker, open-water) gradient rather than stand
+    # out as a pale seam down the frame's edges.
+    ocean = hex_of("ocean_blue")
     fig, ax = plt.subplots(figsize=(target_w_px / dpi, target_h_px / dpi), dpi=dpi, facecolor=ocean)
     ax.set_facecolor(ocean)
     ax.set_aspect("equal")  # preserves true shape — no stretching
@@ -999,11 +1024,13 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     draw.text((title_x, strip_y0 + 40), country_name.upper(), font=f_title, fill=rgb("text_dark"))
 
     # Brand artwork — fixed box, same fit/center treatment as the flag,
-    # placed under the title in place of the old facts block.
+    # placed under the title in place of the old facts block. Starts
+    # right below the title's max possible height and runs down to
+    # near the strip's bottom edge — as big as this space allows.
     if os.path.exists(ARTWORK_PATH):
         artwork_fitted = fit_image_in_box(Image.open(ARTWORK_PATH).convert("RGBA"), ARTWORK_BOX_W, ARTWORK_BOX_H)
         artwork_x = int(name_x + (name_max_w - ARTWORK_BOX_W) / 2)
-        artwork_y = strip_y0 + 160
+        artwork_y = strip_y0 + 135
         canvas.paste(artwork_fitted, (artwork_x, artwork_y), artwork_fitted)
 
     # Locator — top right corner of the strip. Sized to its true aspect
@@ -1022,6 +1049,11 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     map_y1 = CANVAS_H - FOOTER_H
     main_img = Image.open(main_map_path)
     canvas.paste(main_img, (0, map_y0))
+
+    # A dedicated divider, drawn *after* the map paste (the top strip's
+    # own border line sits exactly at this y and was getting overwritten
+    # by the paste above, effectively erasing it).
+    draw.rectangle([0, map_y0 - 3, CANVAS_W, map_y0 + 3], fill=rgb("text_dark"))
 
     # Beach pin key, bottom-left overlay on the map — wraps into another
     # column instead of running off the map when there are many pins.
