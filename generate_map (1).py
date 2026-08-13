@@ -89,8 +89,6 @@ BRAND = {
     "brick_red": (192, 59, 43),
     "sand": (236, 220, 180),        # clearly tan, not a near-white
     "sand_deep": (216, 194, 143),   # darker end of the top-strip gradient
-    "gold_accent": (250, 194, 61),  # high-contrast headline color on navy —
-                                     # aqua read as blue-on-blue and blended in
     "white": (255, 255, 255),
     "text_dark": (30, 30, 30),
     "highlight_land": (61, 168, 99),   # the featured country's fill — a bold,
@@ -899,15 +897,17 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     # right. This poster is viewed on phone screens, scaled way down —
     # these corner texts need to survive that, so they're sized to
     # fill most of the bar height, not just "readable at full size."
-    # All four corners of the poster (this bar + the footer) use the
-    # same gold accent for their text, consistently.
+    # All four corners of the poster (this bar + the footer) use plain
+    # white — highest possible contrast against navy, and neutral
+    # enough not to visually clash with the warm sand strip just below
+    # this bar (gold read as fighting with that sand tone at a glance).
     draw.rectangle([0, 0, CANVAS_W, HEADER_H], fill=rgb("navy_header"))
     f_header = load_font(56, bold=True)
     f_header_small = load_font(32, bold=True)
-    draw.text((30, (HEADER_H - 56) / 2 - 6), WEBSITE.upper(), font=f_header, fill=rgb("gold_accent"))
+    draw.text((30, (HEADER_H - 56) / 2 - 6), WEBSITE.upper(), font=f_header, fill=rgb("white"))
     label = "BEACH BUM BLUEPRINT MAP SERIES"
     w = draw.textlength(label, font=f_header_small)
-    draw.text((CANVAS_W - w - 30, (HEADER_H - 32) / 2 - 2), label, font=f_header_small, fill=rgb("gold_accent"))
+    draw.text((CANVAS_W - w - 30, (HEADER_H - 32) / 2 - 2), label, font=f_header_small, fill=rgb("white"))
 
     # ---- Top strip: flag, name, facts (left) + locator (right) ----
     strip_y0 = HEADER_H
@@ -946,9 +946,9 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     # to its actual rendered content (not a fixed half-width column) and
     # then centered as a block, so it lines up under the also-centered
     # title instead of looking left-shifted against it.
-    f_label = load_font(22, bold=True)
-    f_value = load_font(22)
-    facts_y = strip_y0 + 130
+    f_label = load_font(30, bold=True)
+    f_value = load_font(28)
+    facts_y = strip_y0 + 145
     facts_list = [
         ("Capital", facts["capital"]),
         ("Language", facts["language"]),
@@ -967,9 +967,9 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
         col = i % 2
         row = i // 2
         fx = facts_block_x + col * col_w
-        fy = facts_y + row * 70
+        fy = facts_y + row * 100
         draw.text((fx, fy), f"{label_text}:", font=f_label, fill=rgb("ocean_blue"))
-        draw.text((fx, fy + 30), wrapped_values[i], font=f_value, fill=rgb("text_dark"))
+        draw.text((fx, fy + 40), wrapped_values[i], font=f_value, fill=rgb("text_dark"))
 
     # Locator — top right corner of the strip. Sized to its true aspect
     # ratio (see LOCATOR_H) so it fills the box with no letterboxing,
@@ -1007,7 +1007,7 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
         draw.text((key_x + 34, key_y + 2), pin["name"], font=f_pin_name, fill=rgb("text_dark"))
         key_y += 32
 
-    # ---- Footer bar ---- same treatment as the header: big, bold, gold
+    # ---- Footer bar ---- same treatment as the header: big, bold, white
     # — legible on a phone screen scaled way down, not just at full size.
     draw.rectangle([0, CANVAS_H - FOOTER_H, CANVAS_W, CANVAS_H], fill=rgb("navy_header"))
     footer_half_w = CANVAS_W / 2 - 50
@@ -1015,11 +1015,11 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     f_footer_contact = load_font(38, bold=True)
     tagline_h = f_footer_tagline.getbbox(TAGLINE)[3]
     draw.text((30, (CANVAS_H - FOOTER_H) + (FOOTER_H - tagline_h) / 2), TAGLINE,
-              font=f_footer_tagline, fill=rgb("gold_accent"))
+              font=f_footer_tagline, fill=rgb("white"))
     w = draw.textlength(CONTACT_EMAIL, font=f_footer_contact)
     contact_h = f_footer_contact.getbbox(CONTACT_EMAIL)[3]
     draw.text((CANVAS_W - w - 30, (CANVAS_H - FOOTER_H) + (FOOTER_H - contact_h) / 2), CONTACT_EMAIL,
-              font=f_footer_contact, fill=rgb("gold_accent"))
+              font=f_footer_contact, fill=rgb("white"))
 
     canvas.save(out_path, "PNG")
 
