@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# runtime cache (downloaded boundary data, geocode cache) — regenerated on first run
+cache/
+
+# per-project input the script auto-creates if missing — not a build artifact,
+# but not something to force into every checkout either
+beach_pins.csv
+
+# generated output posters
+*_map.png
