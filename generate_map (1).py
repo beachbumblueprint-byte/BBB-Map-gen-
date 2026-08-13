@@ -85,7 +85,9 @@ BRAND = {
     "sand": (245, 240, 224),
     "white": (255, 255, 255),
     "text_dark": (30, 30, 30),
-    "hemisphere_shade": (27, 110, 140, 60),  # translucent overlay
+    "highlight_land": (207, 227, 194),   # the featured country's fill (green)
+    "neighbor_land": (186, 190, 196),    # other countries' fill — a clearly
+                                          # different cool gray, not a shade of the same tan
 }
 
 CANVAS_W, CANVAS_H = 2400, 1600
@@ -102,7 +104,7 @@ LOCATOR_LAT_MIN, LOCATOR_LAT_MAX = -60, 85
 LOCATOR_W = 640
 LOCATOR_H = round(LOCATOR_W * (LOCATOR_LAT_MAX - LOCATOR_LAT_MIN) / 360)
 
-MAX_CITY_LABELS = 5  # capital + up to this many more, largest first
+MAX_CITY_LABELS = 1  # capital only — keep the map simple
 
 TAGLINE = "Live Well.  Retire Happy.  Life's Better by the Beach."
 WEBSITE = "www.beachbumblueprint.com"
@@ -418,12 +420,50 @@ def draw_neighbor_labels(ax, world_to_plot, country_idx, view_box):
         candidates.append((clipped.area, row[name_col], clipped.representative_point()))
     candidates.sort(key=lambda c: c[0], reverse=True)
     for _, name, point in candidates[:6]:
-        txt = ax.text(point.x, point.y, name, color="#6b6558", fontsize=10,
+        txt = ax.text(point.x, point.y, name, color="#57524a", fontsize=13,
                        fontstyle="italic", ha="center", va="center", zorder=3)
         txt.set_path_effects([pe.withStroke(linewidth=3, foreground="white")])
 
 
-def draw_city_labels(ax, cities, wrapped):
+def boxes_overlap(a, b):
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return ax0 < bx1 and ax1 > bx0 and ay0 < by1 and ay1 > by0
+
+
+def label_footprint(lon, lat, text, fontsize, dpi, deg_per_px_x, deg_per_px_y, ha="center"):
+    """Estimated bounding box (in data/lon-lat coordinates) a label would
+    occupy, used only for collision avoidance between labels — doesn't
+    need to be pixel-exact, just close enough to keep text from stacking."""
+    w = fontsize * 0.62 * (dpi / 72.0) * len(text) * deg_per_px_x
+    h = fontsize * 1.3 * (dpi / 72.0) * deg_per_px_y
+    if ha == "left":
+        return (lon, lat - h / 2, lon + w, lat + h / 2)
+    if ha == "right":
+        return (lon - w, lat - h / 2, lon, lat + h / 2)
+    return (lon - w / 2, lat - h / 2, lon + w / 2, lat + h / 2)
+
+
+def draw_country_name_label(ax, country_geom, country_row, columns, dpi,
+                             deg_per_px_x, deg_per_px_y, placed_boxes):
+    """Writes the featured country's own name on its landmass (bigger
+    and bolder than the neighbor labels) so the map is self-labeled
+    even without the title above it. Reserves its footprint so other
+    labels (beach pins, cities) get placed clear of it."""
+    name_col = next((c for c in ["NAME", "NAME_LONG", "ADMIN", "SOVEREIGNT"] if c in columns), None)
+    if name_col is None:
+        return
+    name = country_row[name_col]
+    point = country_geom.representative_point()
+    fontsize = 17
+    placed_boxes.append(label_footprint(point.x, point.y, name, fontsize, dpi,
+                                         deg_per_px_x, deg_per_px_y, ha="center"))
+    txt = ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=fontsize,
+                   fontweight="bold", ha="center", va="center", zorder=6)
+    txt.set_path_effects([pe.withStroke(linewidth=4, foreground="white")])
+
+
+def draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, placed_boxes):
     for city in cities:
         if not city["name"]:
             continue
@@ -433,16 +473,14 @@ def draw_city_labels(ax, cities, wrapped):
         ax.plot(lon, city["lat"], marker, markersize=size,
                  color=hex_of("navy_header"), markeredgecolor="white",
                  markeredgewidth=1, zorder=7)
-        txt = ax.text(lon, city["lat"], f"  {city['name']}", color=hex_of("navy_header"),
-                       fontsize=11, fontweight="bold" if city["is_capital"] else "normal",
+        fontsize = 11
+        label_text = f"  {city['name']}"
+        placed_boxes.append(label_footprint(lon, city["lat"], label_text, fontsize, dpi,
+                                             deg_per_px_x, deg_per_px_y, ha="left"))
+        txt = ax.text(lon, city["lat"], label_text, color=hex_of("navy_header"),
+                       fontsize=fontsize, fontweight="bold" if city["is_capital"] else "normal",
                        ha="left", va="center", zorder=8)
         txt.set_path_effects([pe.withStroke(linewidth=3, foreground="white")])
-
-
-def boxes_overlap(a, b):
-    ax0, ay0, ax1, ay1 = a
-    bx0, by0, bx1, by1 = b
-    return ax0 < bx1 and ax1 > bx0 and ay0 < by1 and ay1 > by0
 
 
 # Offsets to try, in points, nearest-to-marker first — (dx, dy). Beach
@@ -498,17 +536,20 @@ def draw_main_map(world, country_row, pins, cities, out_path, target_w_px, targe
             lambda g: fix_dateline_wrap(g)[0] if g is not None else g
         )
 
-    world_to_plot.plot(ax=ax, color="#e8e4d8", edgecolor="#b0aa96", linewidth=0.5)
+    world_to_plot.plot(ax=ax, color=hex_of("neighbor_land"), edgecolor="#8b8f95", linewidth=0.5)
     gpd.GeoSeries([country_geom]).plot(
-        ax=ax, color="#cfe3c2", edgecolor="#5a6b52", linewidth=1.2
+        ax=ax, color=hex_of("highlight_land"), edgecolor="#5a6b52", linewidth=1.2
     )
 
     draw_neighbor_labels(ax, world_to_plot, country_row.name, shp_box(minx, miny, maxx, maxy))
-    draw_city_labels(ax, cities, wrapped)
 
     deg_per_px_x = (maxx - minx) / target_w_px
     deg_per_px_y = (maxy - miny) / target_h_px
     placed_label_boxes = []
+    draw_country_name_label(ax, country_geom, country_row, world_to_plot.columns,
+                             dpi, deg_per_px_x, deg_per_px_y, placed_label_boxes)
+    draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, placed_label_boxes)
+
     for pin in pins:
         lon = pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"]
         ax.plot(lon, pin["lat"], "o", markersize=22,
@@ -531,12 +572,14 @@ def draw_main_map(world, country_row, pins, cities, out_path, target_w_px, targe
     plt.close(fig)
 
 
-def draw_hemisphere_locator(world, country_row, latlng, out_path, box_w, box_h):
-    """One combined locator: shades the country's hemisphere and
-    highlights the country itself — answers 'which half of the globe'
-    and 'exactly where' in a single image. box_w/box_h must match the
-    view's real aspect ratio (360 wide x (LAT_MAX-LAT_MIN) tall) or the
-    map letterboxes instead of filling the frame."""
+def draw_hemisphere_locator(world, country_row, out_path, box_w, box_h):
+    """One combined locator: whole-world view with the equator marked
+    and the country itself highlighted — answers 'which half of the
+    globe' and 'exactly where' in a single image. Both hemispheres are
+    drawn identically (no shading) so the equator line is the only cue.
+    box_w/box_h must match the view's real aspect ratio (360 wide x
+    (LAT_MAX-LAT_MIN) tall) or the map letterboxes instead of filling
+    the frame."""
     dpi = 150
     ocean = hex_of("ocean_light")
     fig, ax = plt.subplots(figsize=(box_w / dpi, box_h / dpi), dpi=dpi, facecolor=ocean)
@@ -544,13 +587,6 @@ def draw_hemisphere_locator(world, country_row, latlng, out_path, box_w, box_h):
     ax.set_aspect("equal")
 
     world.plot(ax=ax, color="#e8e4d8", edgecolor="#b0aa96", linewidth=0.3)
-
-    # Shade the hemisphere the country sits in
-    lat = latlng[0]
-    if lat >= 0:
-        ax.axhspan(0, 90, color=hex_of("ocean_blue"), alpha=0.15, zorder=2)
-    else:
-        ax.axhspan(-90, 0, color=hex_of("ocean_blue"), alpha=0.15, zorder=2)
 
     # Highlight the country: fill its true shape, and also drop a bold
     # dot on its centroid so small countries (Fiji, Costa Rica, etc.)
@@ -745,7 +781,7 @@ def main():
     main_map_w = CANVAS_W
     main_map_h = CANVAS_H - HEADER_H - TOP_STRIP_H - FOOTER_H
     draw_main_map(world, country_row, pins, cities, main_map_path, main_map_w, main_map_h)
-    draw_hemisphere_locator(world, country_row, facts["latlng"], locator_path, LOCATOR_W, LOCATOR_H)
+    draw_hemisphere_locator(world, country_row, locator_path, LOCATOR_W, LOCATOR_H)
 
     print("6/6  Composing final poster...")
     compose_poster(facts["name"], facts, pins, main_map_path, locator_path, out_path)
