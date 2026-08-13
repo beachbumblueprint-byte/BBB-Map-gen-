@@ -91,30 +91,30 @@ BRAND = {
     "sand_deep": (216, 194, 143),   # darker end of the top-strip gradient
     "white": (255, 255, 255),
     "text_dark": (30, 30, 30),
-    "highlight_land": (61, 168, 99),   # the featured country's fill — a bold,
-                                        # saturated green so it still reads as
-                                        # "the star" next to colorful neighbors
-    "neighbor_land": (186, 190, 196),  # fallback only, if a country name column
+    "highlight_land": (36, 156, 108),   # a modern emerald green for the
+                                         # featured country — still reads as
+                                         # "the star" next to the neighbors
+    "neighbor_land": (200, 202, 206),  # fallback only, if a country name column
                                         # isn't available to pick a palette color
 }
 
 # Each non-featured country gets its own color from this set (picked
 # deterministically per country name) instead of one flat fill, so
 # neighboring countries are never the same color as each other and the
-# map doesn't read as a flat, muted block. A curated jewel-tone palette —
-# rich and saturated for pop, but deliberately not primary-color
-# "kindergarten" orange/purple/red/yellow, to read as a considered brand
-# rather than a default chart palette.
+# map doesn't read as a flat, muted block. Lighter/softer than a typical
+# jewel-tone palette on purpose — dark navy label text sits directly on
+# these with no outline, so they need enough headroom to stay legible;
+# no purple/indigo (didn't land well) and nothing that competes with
+# the featured country's green.
 NEIGHBOR_PALETTE = [
-    "#1B7F79",  # deep teal
-    "#3D4E8C",  # indigo
-    "#C08A2E",  # bronze/amber
-    "#754C77",  # plum
-    "#3E6E8C",  # slate blue
-    "#A85C73",  # dusty rose
-    "#6E7C3C",  # olive
-    "#8A5A3B",  # umber
-    "#4E5D6C",  # charcoal blue
+    "#5FBBAF",  # soft teal
+    "#E3AE58",  # warm gold
+    "#DB9678",  # terracotta
+    "#D19BAC",  # dusty rose
+    "#84AECD",  # soft blue (not purple)
+    "#C39A66",  # caramel tan
+    "#A7B078",  # soft sage
+    "#B6A0A3",  # warm mauve gray
 ]
 
 
@@ -125,7 +125,6 @@ CANVAS_W, CANVAS_H = 2400, 1600
 HEADER_H = 112             # tall enough for genuinely large corner text —
 FOOTER_H = 92               # this is meant to be viewed on a phone screen
 TOP_STRIP_H = 340          # flag + name + facts strip, full width
-FLAG_COLUMN_W = 440        # reserved left column the flag is centered in
 FLAG_BOX_W, FLAG_BOX_H = 380, 240  # most flags share a similar aspect ratio,
                                     # so a bigger fixed box is safe to standardize on
 
@@ -921,37 +920,19 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     # still render on top of it instead of getting cut by it.
     draw.rectangle([0, strip_y0, CANVAS_W - 1, strip_y1], outline=rgb("navy_header"), width=5)
 
-    # Flag — fit, never stretched, uniform frame. Centered (both ways) in
-    # its own reserved column rather than pinned to the top-left corner,
-    # and sized generously since most flags share a similar aspect ratio.
-    try:
-        flag_raw = download_flag(facts["cca2"])
-        flag_fitted = fit_image_in_box(flag_raw, FLAG_BOX_W, FLAG_BOX_H)
-    except Exception as e:
-        print(f"  Warning: could not load flag ({e}) — using placeholder.")
-        flag_fitted = placeholder_flag(FLAG_BOX_W, FLAG_BOX_H)
-    flag_x = int((FLAG_COLUMN_W - FLAG_BOX_W) / 2)
-    flag_y = int(strip_y0 + (TOP_STRIP_H - FLAG_BOX_H) / 2)
-    draw.rectangle([flag_x - 4, flag_y - 4, flag_x + FLAG_BOX_W + 4, flag_y + FLAG_BOX_H + 4],
-                    outline=rgb("ocean_blue"), width=3)
-    canvas.paste(flag_fitted, (flag_x, flag_y), flag_fitted)
-
-    # Country name — auto-sized so long names never overflow, centered
-    # in the space between the flag and the locator
-    name_x = FLAG_COLUMN_W + 20
+    # Country name and facts columns start at a fixed x — computed first
+    # so the flag (below) can be centered against where this text
+    # *actually* renders, not a guessed column width. Both the title and
+    # the facts block are themselves centered within this column, so
+    # their real left edge is well right of name_x.
+    name_x = 520
     name_max_w = CANVAS_W - LOCATOR_W - name_x - 40
     f_title = autosize_font(draw, country_name.upper(), name_max_w, start_size=72, min_size=32)
     title_w = draw.textlength(country_name.upper(), font=f_title)
-    draw.text((name_x + (name_max_w - title_w) / 2, strip_y0 + 40),
-              country_name.upper(), font=f_title, fill=rgb("text_dark"))
+    title_x = name_x + (name_max_w - title_w) / 2
 
-    # Facts strip — Capital / Language / Currency / Climate only. Sized
-    # to its actual rendered content (not a fixed half-width column) and
-    # then centered as a block, so it lines up under the also-centered
-    # title instead of looking left-shifted against it.
     f_label = load_font(30, bold=True)
     f_value = load_font(28)
-    facts_y = strip_y0 + 145
     facts_list = [
         ("Capital", facts["capital"]),
         ("Language", facts["language"]),
@@ -966,6 +947,28 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     col_gutter = 70
     col_w = col_content_w + col_gutter
     facts_block_x = name_x + (name_max_w - (col_w * 2 - col_gutter)) / 2
+
+    # Flag — fit, never stretched, uniform frame. Centered between the
+    # left edge of the poster and wherever the title/facts text actually
+    # starts (not a fixed guess), and sized generously since most flags
+    # share a similar aspect ratio.
+    try:
+        flag_raw = download_flag(facts["cca2"])
+        flag_fitted = fit_image_in_box(flag_raw, FLAG_BOX_W, FLAG_BOX_H)
+    except Exception as e:
+        print(f"  Warning: could not load flag ({e}) — using placeholder.")
+        flag_fitted = placeholder_flag(FLAG_BOX_W, FLAG_BOX_H)
+    text_left_edge = min(title_x, facts_block_x)
+    flag_x = max(20, int((text_left_edge - FLAG_BOX_W) / 2))
+    flag_y = int(strip_y0 + (TOP_STRIP_H - FLAG_BOX_H) / 2)
+    draw.rectangle([flag_x - 4, flag_y - 4, flag_x + FLAG_BOX_W + 4, flag_y + FLAG_BOX_H + 4],
+                    outline=rgb("ocean_blue"), width=3)
+    canvas.paste(flag_fitted, (flag_x, flag_y), flag_fitted)
+
+    draw.text((title_x, strip_y0 + 40), country_name.upper(), font=f_title, fill=rgb("text_dark"))
+
+    # Facts strip — Capital / Language / Currency / Climate only
+    facts_y = strip_y0 + 145
     for i, (label_text, value_text) in enumerate(facts_list):
         col = i % 2
         row = i // 2
