@@ -439,6 +439,46 @@ def draw_city_labels(ax, cities, wrapped):
         txt.set_path_effects([pe.withStroke(linewidth=3, foreground="white")])
 
 
+def boxes_overlap(a, b):
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return ax0 < bx1 and ax1 > bx0 and ay0 < by1 and ay1 > by0
+
+
+# Offsets to try, in points, nearest-to-marker first — (dx, dy). Beach
+# names cluster tightly on real coastlines, so a single fixed "always
+# to the right" offset collides constantly; trying alternatives and
+# keeping whichever one is actually clear avoids stacking labels
+# on top of each other.
+LABEL_OFFSET_CANDIDATES = [(16, 0), (16, 14), (16, -14), (-16, 0), (-16, 14), (-16, -14), (0, 20), (0, -20)]
+
+
+def place_label(lon, lat, text, fontsize, dpi, deg_per_px_x, deg_per_px_y, placed_boxes):
+    """Picks the first offset (of LABEL_OFFSET_CANDIDATES) whose estimated
+    label footprint doesn't overlap a previously placed label, working in
+    data (lon/lat) coordinates converted from the view's pixel scale."""
+    pt_to_data_x = deg_per_px_x * dpi / 72.0
+    pt_to_data_y = deg_per_px_y * dpi / 72.0
+    w = fontsize * 0.62 * (dpi / 72.0) * len(text) * deg_per_px_x
+    h = fontsize * 1.3 * (dpi / 72.0) * deg_per_px_y
+    chosen = None
+    for dx_pt, dy_pt in LABEL_OFFSET_CANDIDATES:
+        dx, dy = dx_pt * pt_to_data_x, dy_pt * pt_to_data_y
+        ha = "left" if dx_pt >= 0 else "right"
+        box = (lon + dx, lat + dy - h / 2, lon + dx + w, lat + dy + h / 2) if ha == "left" \
+            else (lon + dx - w, lat + dy - h / 2, lon + dx, lat + dy + h / 2)
+        if not any(boxes_overlap(box, pb) for pb in placed_boxes):
+            chosen = (dx_pt, dy_pt, ha, box)
+            break
+    if chosen is None:
+        dx_pt, dy_pt = LABEL_OFFSET_CANDIDATES[0]
+        dx, dy = dx_pt * pt_to_data_x, dy_pt * pt_to_data_y
+        box = (lon + dx, lat + dy - h / 2, lon + dx + w, lat + dy + h / 2)
+        chosen = (dx_pt, dy_pt, "left", box)
+    placed_boxes.append(chosen[3])
+    return chosen[0], chosen[1], chosen[2]
+
+
 def draw_main_map(world, country_row, pins, cities, out_path, target_w_px, target_h_px):
     dpi = 150
     ocean = hex_of("ocean_light")
@@ -466,6 +506,9 @@ def draw_main_map(world, country_row, pins, cities, out_path, target_w_px, targe
     draw_neighbor_labels(ax, world_to_plot, country_row.name, shp_box(minx, miny, maxx, maxy))
     draw_city_labels(ax, cities, wrapped)
 
+    deg_per_px_x = (maxx - minx) / target_w_px
+    deg_per_px_y = (maxy - miny) / target_h_px
+    placed_label_boxes = []
     for pin in pins:
         lon = pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"]
         ax.plot(lon, pin["lat"], "o", markersize=22,
@@ -473,6 +516,12 @@ def draw_main_map(world, country_row, pins, cities, out_path, target_w_px, targe
         ax.text(lon, pin["lat"], str(pin["number"]),
                  color="white", fontsize=11, fontweight="bold",
                  ha="center", va="center", zorder=10)
+        dx_pt, dy_pt, ha = place_label(lon, pin["lat"], pin["name"], 12, dpi,
+                                        deg_per_px_x, deg_per_px_y, placed_label_boxes)
+        label = ax.annotate(pin["name"], xy=(lon, pin["lat"]), xytext=(dx_pt, dy_pt),
+                             textcoords="offset points", ha=ha, va="center",
+                             color=hex_of("text_dark"), fontsize=12, fontweight="bold", zorder=10)
+        label.set_path_effects([pe.withStroke(linewidth=3, foreground="white")])
 
     ax.set_xlim(minx, maxx)
     ax.set_ylim(miny, maxy)
@@ -567,6 +616,12 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     strip_y0 = HEADER_H
     strip_y1 = HEADER_H + TOP_STRIP_H
     draw.rectangle([0, strip_y0, CANVAS_W, strip_y1], fill=rgb("sand"))
+    # Frame it so the sand panel reads as its own zone instead of
+    # blending into the map's similarly pale land color right below it.
+    # Drawn now, before any strip content, so labels that slightly
+    # overhang the frame (e.g. "WHERE IN THE WORLD" above the locator)
+    # still render on top of it instead of getting cut by it.
+    draw.rectangle([0, strip_y0, CANVAS_W - 1, strip_y1], outline=rgb("navy_header"), width=5)
 
     # Flag — fit, never stretched, uniform frame
     try:
