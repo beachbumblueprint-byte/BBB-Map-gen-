@@ -84,7 +84,10 @@ from shapely.prepared import prep
 BRAND = {
     "navy_header": (13, 42, 66),
     "ocean_blue": (27, 110, 140),
-    "ocean_light": (147, 197, 224),  # visibly blue map ocean fill
+    "ocean_light": (72, 150, 189),  # richer mid-blue — the old pale value
+                                     # (147,197,224) read as washed-out,
+                                     # near-white "naked aqua" rather than
+                                     # an intentional ocean color
     "palm_green": (62, 142, 90),
     "aqua": (44, 184, 174),
     "brick_red": (192, 59, 43),
@@ -99,51 +102,35 @@ BRAND = {
                                         # isn't available to pick a palette color
 }
 
-# Each non-featured country gets its own shade from this set (picked
-# deterministically per country name) instead of one flat fill, so
-# neighboring countries are never the same shade as each other. Narrowed
-# down to one cohesive brown/tan family on purpose — a full rainbow of
-# unrelated hues was reading as "too many colors to pick"; keeping the
-# supporting cast in one earth-tone family lets the featured country's
-# green stand out as the one clearly different color on the page, and
-# dark navy label text (no outline) stays legible on all of these.
-NEIGHBOR_PALETTE = [
-    "#B98858",  # warm tan
-    "#8B6F47",  # medium brown
-    "#C9A66B",  # sandy tan
-    "#A67B5B",  # terracotta-brown
-    "#D4B483",  # pale gold-tan
-    "#7A6142",  # deep umber
-]
+# Every non-featured (neighbor) country gets the SAME flat tan fill with
+# plain black label text — no per-country color variation, no adaptive
+# contrast switching. A varying earth-tone palette was tried and read as
+# "brown and white" mud on a phone screen; one consistent, light, readable
+# color for every neighbor keeps the featured country's green as the only
+# thing that stands out, and black-on-tan is legible everywhere by
+# construction, so there's nothing to adapt.
+NEIGHBOR_LAND_COLOR = "#D4B483"  # pale gold-tan
+NEIGHBOR_TEXT_COLOR = "#000000"
 
 
 def neighbor_color_for(name) -> str:
-    return NEIGHBOR_PALETTE[zlib.crc32(str(name).encode("utf-8")) % len(NEIGHBOR_PALETTE)]
-
-
-def adaptive_text_color(bg_hex: str) -> str:
-    """Picks dark-navy or white label text depending on the actual
-    brightness of the specific background it's sitting on — the
-    neighbor palette spans light tans through dark umber, and a single
-    fixed text color reads fine on some of those and badly on others."""
-    r, g, b = (int(bg_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
-    luminance = 0.299 * r + 0.587 * g + 0.114 * b
-    return hex_of("navy_header") if luminance > 140 else "#ffffff"
+    return NEIGHBOR_LAND_COLOR
 
 
 CANVAS_W, CANVAS_H = 2400, 1600
 HEADER_H = 112             # tall enough for genuinely large corner text —
 FOOTER_H = 92               # this is meant to be viewed on a phone screen
-TOP_STRIP_H = 420          # flag + name + artwork strip, full width — grown
-                            # to give the artwork real room instead of
-                            # squeezing it under the title
+TOP_STRIP_H = 560          # flag + name + locator sit in a compact row at
+                            # the top of this strip (see TOP_ROW_H); the
+                            # rest of the strip's height is the beach key's
+                            # dedicated section — this is the map's whole
+                            # point, so it gets a real chunk of the poster
+                            # instead of a cramped map-corner overlay
+TOP_ROW_H = 300            # flag/title/locator row height within the strip
 FLAG_BOX_W, FLAG_BOX_H = 380, 240  # most flags share a similar aspect ratio,
                                     # so a bigger fixed box is safe to standardize on
 
 ARTWORK_PATH = os.path.join(os.path.dirname(__file__), "assets", "bbb_logo.png")
-ARTWORK_BOX_W, ARTWORK_BOX_H = 420, 270  # brand artwork under the country name,
-                                          # same fixed-box treatment as the flag —
-                                          # as big as the strip's remaining height allows
 
 # Locator box, top-right corner of the top strip. Sized to the real
 # aspect ratio of its world view (see LOCATOR_LAT_MIN/MAX below) so the
@@ -485,8 +472,7 @@ def draw_neighbor_labels(ax, world_to_plot, country_idx, view_box):
         candidates.append((clipped.area, row[name_col], clipped.representative_point()))
     candidates.sort(key=lambda c: c[0], reverse=True)
     for _, name, point in candidates[:6]:
-        text_color = adaptive_text_color(neighbor_color_for(name))
-        ax.text(point.x, point.y, name, color=text_color, fontsize=34,
+        ax.text(point.x, point.y, name, color=NEIGHBOR_TEXT_COLOR, fontsize=34,
                  fontweight="bold", ha="center", va="center", zorder=3, clip_on=True)
 
 
@@ -651,18 +637,50 @@ def draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, place
         if not city["name"]:
             continue
         lon = city["lon"] + 360 if (wrapped and city["lon"] < 0) else city["lon"]
-        marker = "*" if city["is_capital"] else "o"
-        size = 24 if city["is_capital"] else 12
+        is_capital = city["is_capital"]
+        # The capital's label got a lot bigger to actually be readable,
+        # which makes it much more likely to land on a nearby beach pin
+        # (a real case on Costa Rica: San José sits close enough to
+        # several pins in every direction that right, left, above, and
+        # below all landed on something at full size). So for the
+        # capital, search both position (right/left/above/below) AND
+        # size — shrink a step and re-try all four positions before
+        # shrinking further, so it only gets smaller than 30pt when a
+        # genuinely tight cluster of pins forces it to.
+        for fontsize in ([30, 26, 22, 18] if is_capital else [18]):
+            offset_deg = fontsize * 1.5 * (dpi / 72.0) * deg_per_px_y
+            candidates = [("left", 0), ("right", 0), ("center", offset_deg), ("center", -offset_deg)] \
+                if is_capital else [("left", 0)]
+            ha, dy = candidates[0]
+            found = False
+            for candidate_ha, candidate_dy in candidates:
+                text = {"left": f"  {city['name']}", "right": f"{city['name']}  ",
+                        "center": city["name"]}[candidate_ha]
+                box = label_footprint(lon, city["lat"] + candidate_dy, text, fontsize, dpi,
+                                       deg_per_px_x, deg_per_px_y, ha=candidate_ha)
+                if not any(boxes_overlap(box, ab) for ab in placed_boxes):
+                    ha, dy, found = candidate_ha, candidate_dy, True
+                    break
+            if found or fontsize == 18:
+                break
+        marker = "*" if is_capital else "o"
+        size = fontsize * 1.5 if is_capital else 12
         ax.plot(lon, city["lat"], marker, markersize=size,
                  color=hex_of("navy_header"), markeredgecolor="white",
-                 markeredgewidth=1.2, zorder=7)
-        fontsize = 18
-        label_text = f"  {city['name']}"
-        placed_boxes.append(label_footprint(lon, city["lat"], label_text, fontsize, dpi,
-                                             deg_per_px_x, deg_per_px_y, ha="left"))
-        ax.text(lon, city["lat"], label_text, color=hex_of("navy_header"),
-                 fontsize=fontsize, fontweight="bold" if city["is_capital"] else "normal",
-                 ha="left", va="center", zorder=8, clip_on=True)
+                 markeredgewidth=2.2 if is_capital else 1.2, zorder=7)
+        label_text = {"left": f"  {city['name']}", "right": f"{city['name']}  ",
+                      "center": city["name"]}[ha]
+        placed_boxes.append(label_footprint(lon, city["lat"] + dy, label_text, fontsize, dpi,
+                                             deg_per_px_x, deg_per_px_y, ha=ha))
+        txt = ax.text(lon, city["lat"] + dy, label_text, color=hex_of("navy_header"),
+                 fontsize=fontsize, fontweight="bold" if is_capital else "normal",
+                 ha=ha, va="center", zorder=8, clip_on=True)
+        if is_capital:
+            # A capital city label has to survive sitting on top of any
+            # fill color on the map (green featured country, tan
+            # neighbor) — a white halo guarantees contrast either way
+            # instead of relying on one hardcoded text color.
+            txt.set_path_effects([pe.withStroke(linewidth=4, foreground="white")])
 
 
 
@@ -995,10 +1013,13 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     # still render on top of it instead of getting cut by it.
     draw.rectangle([0, strip_y0, CANVAS_W - 1, strip_y1], outline=rgb("navy_header"), width=5)
 
-    # Country name column starts at a fixed x — computed first so the
-    # flag (below) can be centered against where this text *actually*
-    # renders, not a guessed column width. The title is itself centered
-    # within this column, so its real left edge is well right of name_x.
+    # Top row of the strip: flag, country name, locator — a compact
+    # band across TOP_ROW_H, with the rest of the strip's height handed
+    # entirely to the beach key below it (see below). Name column starts
+    # at a fixed x — computed first so the flag (below) can be centered
+    # against where this text *actually* renders, not a guessed column
+    # width. The title is itself centered within this column, so its
+    # real left edge is well right of name_x.
     name_x = 520
     name_max_w = CANVAS_W - LOCATOR_W - name_x - 40
     f_title = autosize_font(draw, country_name.upper(), name_max_w, start_size=72, min_size=32)
@@ -1016,22 +1037,65 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
         print(f"  Warning: could not load flag ({e}) — using placeholder.")
         flag_fitted = placeholder_flag(FLAG_BOX_W, FLAG_BOX_H)
     flag_x = max(20, int((title_x - FLAG_BOX_W) / 2))
-    flag_y = int(strip_y0 + (TOP_STRIP_H - FLAG_BOX_H) / 2)
+    flag_y = int(strip_y0 + (TOP_ROW_H - FLAG_BOX_H) / 2)
     draw.rectangle([flag_x - 4, flag_y - 4, flag_x + FLAG_BOX_W + 4, flag_y + FLAG_BOX_H + 4],
                     outline=rgb("ocean_blue"), width=3)
     canvas.paste(flag_fitted, (flag_x, flag_y), flag_fitted)
 
     draw.text((title_x, strip_y0 + 40), country_name.upper(), font=f_title, fill=rgb("text_dark"))
 
-    # Brand artwork — fixed box, same fit/center treatment as the flag,
-    # placed under the title in place of the old facts block. Starts
-    # right below the title's max possible height and runs down to
-    # near the strip's bottom edge — as big as this space allows.
-    if os.path.exists(ARTWORK_PATH):
-        artwork_fitted = fit_image_in_box(Image.open(ARTWORK_PATH).convert("RGBA"), ARTWORK_BOX_W, ARTWORK_BOX_H)
-        artwork_x = int(name_x + (name_max_w - ARTWORK_BOX_W) / 2)
-        artwork_y = strip_y0 + 135
-        canvas.paste(artwork_fitted, (artwork_x, artwork_y), artwork_fitted)
+    # Beach pin key — its own dedicated section spanning the full strip
+    # width below the flag/title/locator row, instead of squeezed beside
+    # them or overlaid on a corner of the map. This is the whole point
+    # of the map, so it gets a real chunk of the poster, sized as big as
+    # this section allows and only shrinking if a map has an unusually
+    # large number of pins.
+    key_section_y0 = strip_y0 + TOP_ROW_H + 15
+    key_label = "BEACHES ON THIS MAP"
+    draw.text((30, key_section_y0), key_label, font=load_font(26, bold=True), fill=rgb("ocean_blue"))
+
+    key_x0, key_y0 = 30, key_section_y0 + 42
+    key_x1, key_y1 = CANVAS_W - 30, strip_y1 - 15
+    key_row_h, r = 100, 36
+    f_pin_num = load_font(34, bold=True)
+    f_pin_name = load_font(38, bold=True)
+
+    def layout_key(font_num, font_name, r, row_h):
+        """Flows pins left-to-right, each taking only the width its own
+        name actually needs (not a fixed column width — beach names
+        vary a lot in length, and a fixed column was letting long names
+        run into the next entry). Wraps to a new row when an entry
+        would run past the right margin."""
+        x, y, entries, row_count = key_x0, 0, [], 1
+        for pin in pins:
+            text_w = draw.textlength(pin["name"], font=font_name)
+            entry_w = r * 2 + 16 + text_w + 60
+            if x + entry_w > key_x1 and x > key_x0:
+                x, y = key_x0, y + row_h
+                row_count += 1
+            entries.append((pin, x, y))
+            x += entry_w
+        return entries, row_count
+
+    # Shrink only as much as needed if this particular map's pins don't
+    # all fit at full size within the section's height — most maps
+    # (5-ish pins) never hit this.
+    entries, row_count = layout_key(f_pin_num, f_pin_name, r, key_row_h)
+    while row_count * key_row_h > (key_y1 - key_y0) and key_row_h > 46:
+        key_row_h -= 6
+        r = max(18, r - 3)
+        f_pin_num = load_font(max(20, f_pin_num.size - 3), bold=True)
+        f_pin_name = load_font(max(22, f_pin_name.size - 3), bold=True)
+        entries, row_count = layout_key(f_pin_num, f_pin_name, r, key_row_h)
+
+    for pin, ex, ey in entries:
+        cx, cy = ex + r, key_y0 + ey + r
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=rgb("brick_red"), outline=rgb("white"), width=3)
+        num_w = draw.textlength(str(pin["number"]), font=f_pin_num)
+        draw.text((cx - num_w / 2, cy - f_pin_num.size / 2 - 2), str(pin["number"]),
+                   font=f_pin_num, fill=rgb("white"))
+        draw.text((ex + r * 2 + 16, key_y0 + ey + (key_row_h - f_pin_name.size) / 2 - 4), pin["name"],
+                   font=f_pin_name, fill=rgb("text_dark"))
 
     # Locator — top right corner of the strip. Sized to its true aspect
     # ratio (see LOCATOR_H) so it fills the box with no letterboxing,
@@ -1055,32 +1119,12 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     # by the paste above, effectively erasing it).
     draw.rectangle([0, map_y0 - 3, CANVAS_W, map_y0 + 3], fill=rgb("text_dark"))
 
-    # Beach pin key, bottom-left overlay on the map — wraps into another
-    # column instead of running off the map when there are many pins.
-    # Sized big — this is the legend for the entire point of the map
-    # (which beach is which number), so it can't be the part that's
-    # hard to read.
-    key_x0, key_y0 = 30, map_y0 + 20
-    key_col_w = 440
-    key_row_h = 52
-    key_y_max = map_y1 - 20
-    key_x, key_y = key_x0, key_y0
-    f_pin_num = load_font(24, bold=True)
-    f_pin_name = load_font(28, bold=True)
-    for pin in pins:
-        if key_y + key_row_h > key_y_max:
-            key_x += key_col_w
-            key_y = key_y0
-        cx, cy, r = key_x + 20, key_y + 20, 21
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=rgb("brick_red"), outline=rgb("white"), width=3)
-        num_w = draw.textlength(str(pin["number"]), font=f_pin_num)
-        draw.text((cx - num_w / 2, cy - 15), str(pin["number"]), font=f_pin_num, fill=rgb("white"))
-        draw.text((key_x + 50, key_y + 6), pin["name"], font=f_pin_name, fill=rgb("text_dark"))
-        key_y += key_row_h
-
     # ---- Footer bar ---- tagline stays put; "map series" moved down
     # here from the header (contact info took over the top bar) — same
-    # big/bold/white treatment either way.
+    # big/bold/white treatment either way. The brand artwork now lives
+    # here too, centered between the two texts — it moved out of the
+    # top strip to free that space for the beach key, which needed the
+    # room far more than the artwork did.
     draw.rectangle([0, CANVAS_H - FOOTER_H, CANVAS_W, CANVAS_H], fill=rgb("navy_header"))
     footer_half_w = CANVAS_W / 2 - 50
     f_footer_tagline = autosize_font(draw, TAGLINE, footer_half_w, start_size=40, bold=True, min_size=22)
@@ -1093,6 +1137,19 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     series_h = f_footer_series.getbbox(map_series_label)[3]
     draw.text((CANVAS_W - w - 30, (CANVAS_H - FOOTER_H) + (FOOTER_H - series_h) / 2), map_series_label,
               font=f_footer_series, fill=rgb("white"))
+
+    if os.path.exists(ARTWORK_PATH):
+        # The source asset is solid black ink on transparent — fine on
+        # the light sand strip, invisible on this navy bar, so it's
+        # recolored white (alpha untouched) to match the header/footer
+        # white-on-navy treatment used everywhere else on the poster.
+        artwork_raw = Image.open(ARTWORK_PATH).convert("RGBA")
+        white_artwork = Image.new("RGBA", artwork_raw.size, (255, 255, 255, 0))
+        white_artwork.putalpha(artwork_raw.getchannel("A"))
+        artwork_fitted = fit_image_in_box(white_artwork, 150, FOOTER_H - 16)
+        artwork_x = int((CANVAS_W - artwork_fitted.width) / 2)
+        artwork_y = int(CANVAS_H - FOOTER_H + (FOOTER_H - artwork_fitted.height) / 2)
+        canvas.paste(artwork_fitted, (artwork_x, artwork_y), artwork_fitted)
 
     canvas.save(out_path, "PNG")
 
