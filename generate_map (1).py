@@ -67,6 +67,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw, ImageFont
+from shapely.ops import transform as shp_transform
 
 # ---------------------------------------------------------------------
 # BRAND CONSTANTS — locked BBB style. Change once here, applies to
@@ -131,7 +132,8 @@ def get_country_facts(country_name: str) -> dict:
     resp.raise_for_status()
     data = resp.json()[0]
 
-    capital = data.get("capital", ["—"])[0]
+    capital_list = data.get("capital") or []
+    capital = capital_list[0] if capital_list else "—"
     languages = ", ".join(data.get("languages", {}).values()) or "—"
     currencies = data.get("currencies", {})
     if currencies:
@@ -159,10 +161,25 @@ def get_country_facts(country_name: str) -> dict:
 
 
 def download_flag(cca2: str) -> Image.Image:
+    if not cca2:
+        raise ValueError("no country code available to look up a flag")
     url = f"https://flagcdn.com/w320/{cca2.lower()}.png"
     resp = requests.get(url, timeout=20)
     resp.raise_for_status()
     return Image.open(io.BytesIO(resp.content)).convert("RGBA")
+
+
+def placeholder_flag(box_w: int, box_h: int) -> Image.Image:
+    """Blank frame with a note, used when no flag is available for a
+    country (e.g. missing/unrecognized ISO code) instead of crashing."""
+    canvas = Image.new("RGBA", (box_w, box_h), (255, 255, 255, 255))
+    d = ImageDraw.Draw(canvas)
+    d.rectangle([0, 0, box_w - 1, box_h - 1], outline=(180, 180, 180), width=2)
+    text = "No flag\navailable"
+    font = load_font(20)
+    d.multiline_text((box_w / 2, box_h / 2), text, font=font, fill=(140, 140, 140),
+                      anchor="mm", align="center")
+    return canvas
 
 
 def fit_image_in_box(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
@@ -273,7 +290,7 @@ def load_beach_pins(csv_path: str, country_name: str) -> list:
             query = row.get("geocode_query", "").strip() or f"{row['beach_name']}, {country_name}"
             lat, lon = geocode_place(query)
             pins.append({
-                "number": row["pin_number"],
+                "number": int(row["pin_number"]),
                 "name": row["beach_name"],
                 "lat": lat,
                 "lon": lon,
@@ -306,25 +323,49 @@ def compute_padded_extent(minx, miny, maxx, maxy, target_aspect, base_pad_frac=0
     return minx - pad_x, miny - pad_y, maxx + pad_x, maxy + pad_y
 
 
+def fix_dateline_wrap(geometry):
+    """Countries that cross the antimeridian (Fiji, Russia's far east,
+    the US via the Aleutians) have geometry spanning from ~+180 to
+    ~-180, so a naive bounding box comes out ~360 degrees wide instead
+    of the country's true (much narrower) extent. When that happens,
+    shift the negative-longitude side by +360 so the country renders
+    as one contiguous landmass instead of the map zooming out to fit
+    the whole globe. Returns (geometry, was_shifted)."""
+    minx, _, maxx, _ = geometry.bounds
+    if maxx - minx <= 180:
+        return geometry, False
+    shifted = shp_transform(lambda x, y, z=None: (x + 360 if x < 0 else x, y), geometry)
+    return shifted, True
+
+
 def draw_main_map(world, country_row, pins, out_path, target_w_px, target_h_px):
     dpi = 150
     fig, ax = plt.subplots(figsize=(target_w_px / dpi, target_h_px / dpi), dpi=dpi)
     ax.set_facecolor((190 / 255, 220 / 255, 235 / 255))
     ax.set_aspect("equal")  # preserves true shape — no stretching
 
-    minx, miny, maxx, maxy = country_row.geometry.bounds
+    country_geom, wrapped = fix_dateline_wrap(country_row.geometry)
+    minx, miny, maxx, maxy = country_geom.bounds
     target_aspect = target_w_px / target_h_px
     minx, miny, maxx, maxy = compute_padded_extent(minx, miny, maxx, maxy, target_aspect)
 
-    world.plot(ax=ax, color="#e8e4d8", edgecolor="#b0aa96", linewidth=0.5)
-    gpd.GeoSeries([country_row.geometry]).plot(
+    world_to_plot = world
+    if wrapped:
+        world_to_plot = world.copy()
+        world_to_plot["geometry"] = world_to_plot.geometry.apply(
+            lambda g: fix_dateline_wrap(g)[0] if g is not None else g
+        )
+
+    world_to_plot.plot(ax=ax, color="#e8e4d8", edgecolor="#b0aa96", linewidth=0.5)
+    gpd.GeoSeries([country_geom]).plot(
         ax=ax, color="#cfe3c2", edgecolor="#5a6b52", linewidth=1.2
     )
 
     for pin in pins:
-        ax.plot(pin["lon"], pin["lat"], "o", markersize=22,
+        lon = pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"]
+        ax.plot(lon, pin["lat"], "o", markersize=22,
                  color="#" + "%02x%02x%02x" % BRAND["brick_red"], zorder=5)
-        ax.text(pin["lon"], pin["lat"], str(pin["number"]),
+        ax.text(lon, pin["lat"], str(pin["number"]),
                  color="white", fontsize=11, fontweight="bold",
                  ha="center", va="center", zorder=6)
 
@@ -417,8 +458,12 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     draw.rectangle([0, strip_y0, CANVAS_W, strip_y1], fill=rgb("sand"))
 
     # Flag — fit, never stretched, uniform frame
-    flag_raw = download_flag(facts["cca2"])
-    flag_fitted = fit_image_in_box(flag_raw, FLAG_BOX_W, FLAG_BOX_H)
+    try:
+        flag_raw = download_flag(facts["cca2"])
+        flag_fitted = fit_image_in_box(flag_raw, FLAG_BOX_W, FLAG_BOX_H)
+    except Exception as e:
+        print(f"  Warning: could not load flag ({e}) — using placeholder.")
+        flag_fitted = placeholder_flag(FLAG_BOX_W, FLAG_BOX_H)
     flag_x, flag_y = 40, strip_y0 + 30
     draw.rectangle([flag_x - 4, flag_y - 4, flag_x + FLAG_BOX_W + 4, flag_y + FLAG_BOX_H + 4],
                     outline=rgb("ocean_blue"), width=3)
@@ -465,11 +510,18 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     main_img = Image.open(main_map_path)
     canvas.paste(main_img, (0, map_y0))
 
-    # Beach pin key, bottom-left overlay on the map
-    key_x, key_y = 30, map_y0 + 20
+    # Beach pin key, bottom-left overlay on the map — wraps into another
+    # column instead of running off the map when there are many pins.
+    key_x0, key_y0 = 30, map_y0 + 20
+    key_col_w = 280
+    key_y_max = map_y1 - 20
+    key_x, key_y = key_x0, key_y0
     f_pin_num = load_font(16, bold=True)
     f_pin_name = load_font(18)
     for pin in pins:
+        if key_y + 32 > key_y_max:
+            key_x += key_col_w
+            key_y = key_y0
         cx, cy, r = key_x + 12, key_y + 12, 13
         draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=rgb("brick_red"), outline=rgb("white"), width=2)
         num_w = draw.textlength(str(pin["number"]), font=f_pin_num)
