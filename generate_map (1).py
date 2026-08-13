@@ -44,7 +44,7 @@ import zlib
 # packages aren't installed yet, this installs them automatically the
 # first time you run the script. No separate requirements.txt needed.
 # ---------------------------------------------------------------------
-REQUIRED_PACKAGES = ["requests", "geopandas", "matplotlib", "Pillow", "shapely", "pyproj", "fiona"]
+REQUIRED_PACKAGES = ["requests", "geopandas", "matplotlib", "Pillow", "shapely", "pyproj", "fiona", "numpy"]
 
 
 def ensure_packages_installed():
@@ -62,15 +62,18 @@ def ensure_packages_installed():
 
 ensure_packages_installed()
 
+import numpy as np
 import requests
 import geopandas as gpd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 from PIL import Image, ImageDraw, ImageFont
-from shapely.geometry import box as shp_box
+from shapely.geometry import box as shp_box, Point
 from shapely.ops import transform as shp_transform
+from shapely.prepared import prep
 
 # ---------------------------------------------------------------------
 # BRAND CONSTANTS — locked BBB style. Change once here, applies to
@@ -96,19 +99,20 @@ BRAND = {
 # Each non-featured country gets its own color from this set (picked
 # deterministically per country name) instead of one flat fill, so
 # neighboring countries are never the same color as each other and the
-# map doesn't read as a flat, muted block. Bold/saturated on purpose —
-# this is a sales piece, not a survey atlas.
+# map doesn't read as a flat, muted block. A curated jewel-tone palette —
+# rich and saturated for pop, but deliberately not primary-color
+# "kindergarten" orange/purple/red/yellow, to read as a considered brand
+# rather than a default chart palette.
 NEIGHBOR_PALETTE = [
-    "#F4A200",  # amber
-    "#7B3FA0",  # purple
-    "#17A398",  # teal
-    "#FF7F50",  # coral orange
-    "#4C7EB5",  # steel blue
-    "#D4A017",  # mustard
-    "#C2478A",  # magenta
-    "#B06A45",  # terracotta
-    "#5B5EA6",  # indigo
-    "#E0607E",  # rose
+    "#1B7F79",  # deep teal
+    "#3D4E8C",  # indigo
+    "#C08A2E",  # bronze/amber
+    "#754C77",  # plum
+    "#3E6E8C",  # slate blue
+    "#A85C73",  # dusty rose
+    "#6E7C3C",  # olive
+    "#8A5A3B",  # umber
+    "#4E5D6C",  # charcoal blue
 ]
 
 
@@ -469,23 +473,75 @@ def label_footprint(lon, lat, text, fontsize, dpi, deg_per_px_x, deg_per_px_y, h
     return (lon - w / 2, lat - h / 2, lon + w / 2, lat + h / 2)
 
 
+def find_open_space_point(geometry, text, fontsize, dpi, deg_per_px_x, deg_per_px_y,
+                           avoid_boxes=(), grid_n=60, min_size_frac=0.5):
+    """Finds a spot inside the shape for `text` at `fontsize`: among grid
+    points where the text's own rendered bounding box wouldn't overlap
+    any avoid_boxes (exclusion zones around pins/cities) AND the text
+    fully fits inside the shape, picks whichever is deepest inside the
+    shape (farthest from its own boundary) — the biggest unoccupied
+    void. A country's true geometric "widest" point often coincides
+    with its main pin cluster (that's usually why the cluster is
+    there), so this checks the label's real footprint rather than just
+    a point, and shrinks the font if nothing fits until something does."""
+    minx, miny, maxx, maxy = geometry.bounds
+    boundary = geometry.boundary
+    prepared = prep(geometry)
+
+    size = fontsize
+    while size >= fontsize * min_size_frac:
+        best_clear, best_clear_score = None, -1.0
+        best_any, best_any_score = None, -1.0
+        for i in range(grid_n + 1):
+            x = minx + (maxx - minx) * i / grid_n
+            for j in range(grid_n + 1):
+                y = miny + (maxy - miny) * j / grid_n
+                p = Point(x, y)
+                if not prepared.contains(p):
+                    continue
+                bd = boundary.distance(p)
+                if bd > best_any_score:
+                    best_any_score, best_any = bd, p
+                box = label_footprint(x, y, text, size, dpi, deg_per_px_x, deg_per_px_y, ha="center")
+                fits_inside = prepared.contains(Point(box[0], box[1])) and prepared.contains(Point(box[2], box[3])) \
+                    and prepared.contains(Point(box[0], box[3])) and prepared.contains(Point(box[2], box[1]))
+                if fits_inside and not any(boxes_overlap(box, ab) for ab in avoid_boxes):
+                    if bd > best_clear_score:
+                        best_clear_score, best_clear = bd, p
+        if best_clear is not None:
+            return best_clear, size
+        size -= 2
+    return (best_any if best_any is not None else geometry.representative_point()), fontsize * min_size_frac
+
+
+def avoid_boxes_for(points, dpi, deg_per_px_x, deg_per_px_y, pad_pt=95):
+    """Small exclusion zone around each (lon, lat) clutter point (pins,
+    cities) — generous enough to roughly cover their icon plus a nearby
+    name label — used to keep the big country-name label from landing
+    on top of them."""
+    pad_x = pad_pt * dpi / 72.0 * deg_per_px_x
+    pad_y = pad_pt * dpi / 72.0 * deg_per_px_y
+    return [(x - pad_x, y - pad_y, x + pad_x, y + pad_y) for x, y in points]
+
+
 def draw_country_name_label(ax, country_geom, country_row, columns, dpi,
-                             deg_per_px_x, deg_per_px_y, placed_boxes):
-    """Writes the featured country's own name on its landmass (bigger
-    and bolder than the neighbor labels) so the map is self-labeled
-    even without the title above it. Reserves its footprint so other
-    labels (beach pins, cities) get placed clear of it."""
+                             deg_per_px_x, deg_per_px_y, placed_boxes, avoid_points):
+    """Writes the featured country's own name in the biggest open patch
+    of its landmass, big and bold, so the map is self-labeled even
+    without the title above it. Reserves its footprint so other labels
+    (beach pins, cities) get placed clear of it."""
     name_col = next((c for c in ["NAME", "NAME_LONG", "ADMIN", "SOVEREIGNT"] if c in columns), None)
     if name_col is None:
         return
     name = country_row[name_col]
-    point = country_geom.representative_point()
-    fontsize = 20
+    avoid_boxes = avoid_boxes_for(avoid_points, dpi, deg_per_px_x, deg_per_px_y)
+    point, fontsize = find_open_space_point(country_geom, name, 32, dpi,
+                                             deg_per_px_x, deg_per_px_y, avoid_boxes)
     placed_boxes.append(label_footprint(point.x, point.y, name, fontsize, dpi,
                                          deg_per_px_x, deg_per_px_y, ha="center"))
     txt = ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=fontsize,
                    fontweight="bold", ha="center", va="center", zorder=6)
-    txt.set_path_effects([pe.withStroke(linewidth=4, foreground="white")])
+    txt.set_path_effects([pe.withStroke(linewidth=5, foreground="white")])
 
 
 def draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, placed_boxes):
@@ -556,6 +612,53 @@ def place_label(lon, lat, text, fontsize, dpi, deg_per_px_x, deg_per_px_y, place
     return best[1], best[2], best[3]
 
 
+_DIVER_FLAG_CACHE = {}
+
+
+def make_diver_flag_icon(number, px=120):
+    """Renders a classic 'diver down' flag (red field, white diagonal
+    stripe) on a short pole, with the pin number on a badge at its base,
+    as the beach-pin marker. Cached per number since the same number
+    always looks identical."""
+    if number in _DIVER_FLAG_CACHE:
+        return _DIVER_FLAG_CACHE[number]
+
+    img = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    pole_x = px * 0.20
+    pole_bottom = px * 0.94
+    d.line([(pole_x, px * 0.04), (pole_x, pole_bottom)], fill=(50, 50, 50), width=max(2, px // 30))
+
+    flag_left, flag_top = pole_x, px * 0.04
+    flag_right, flag_bottom = px * 0.95, px * 0.50
+    d.rectangle([flag_left, flag_top, flag_right, flag_bottom], fill=(206, 26, 26))
+    d.line([(flag_left, flag_top), (flag_right, flag_bottom)],
+           fill=(255, 255, 255), width=max(3, int((flag_bottom - flag_top) * 0.34)))
+    d.rectangle([flag_left, flag_top, flag_right, flag_bottom], outline=(40, 40, 40), width=max(1, px // 60))
+
+    badge_r = px * 0.17
+    badge_cx, badge_cy = pole_x, pole_bottom - badge_r * 0.9
+    d.ellipse([badge_cx - badge_r, badge_cy - badge_r, badge_cx + badge_r, badge_cy + badge_r],
+              fill=(206, 26, 26), outline=(255, 255, 255), width=max(2, px // 40))
+    font = load_font(int(badge_r * 1.3), bold=True)
+    text = str(number)
+    bbox = d.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    d.text((badge_cx - tw / 2 - bbox[0], badge_cy - th / 2 - bbox[1]), text, font=font, fill="white")
+
+    _DIVER_FLAG_CACHE[number] = img
+    return img
+
+
+def draw_diver_flag(ax, lon, lat, number):
+    icon = make_diver_flag_icon(number)
+    imagebox = OffsetImage(np.asarray(icon), zoom=0.45)
+    ab = AnnotationBbox(imagebox, (lon, lat), frameon=False, box_alignment=(0.20, 0.06),
+                         pad=0, zorder=9)
+    ax.add_artist(ab)
+
+
 def draw_main_map(world, country_row, pins, cities, out_path, target_w_px, target_h_px):
     dpi = 150
     ocean = hex_of("ocean_light")
@@ -587,17 +690,27 @@ def draw_main_map(world, country_row, pins, cities, out_path, target_w_px, targe
     deg_per_px_x = (maxx - minx) / target_w_px
     deg_per_px_y = (maxy - miny) / target_h_px
     placed_label_boxes = []
+
+    avoid_points = []
+    for city in cities:
+        avoid_points.append((city["lon"] + 360 if (wrapped and city["lon"] < 0) else city["lon"], city["lat"]))
+    for pin in pins:
+        avoid_points.append((pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"], pin["lat"]))
+
     draw_country_name_label(ax, country_geom, country_row, world_to_plot.columns,
-                             dpi, deg_per_px_x, deg_per_px_y, placed_label_boxes)
+                             dpi, deg_per_px_x, deg_per_px_y, placed_label_boxes, avoid_points)
     draw_city_labels(ax, cities, wrapped, dpi, deg_per_px_x, deg_per_px_y, placed_label_boxes)
 
+    pt_to_data_x = dpi / 72.0 * deg_per_px_x
+    pt_to_data_y = dpi / 72.0 * deg_per_px_y
     for pin in pins:
         lon = pin["lon"] + 360 if (wrapped and pin["lon"] < 0) else pin["lon"]
-        ax.plot(lon, pin["lat"], "o", markersize=22,
-                 color=hex_of("brick_red"), zorder=9)
-        ax.text(lon, pin["lat"], str(pin["number"]),
-                 color="white", fontsize=11, fontweight="bold",
-                 ha="center", va="center", zorder=10)
+        draw_diver_flag(ax, lon, pin["lat"], pin["number"])
+        # Reserve the flag icon's rough footprint (mostly above/right of
+        # the anchor, matching its box_alignment) so other pins' name
+        # labels don't get placed underneath it.
+        placed_label_boxes.append((lon - 8 * pt_to_data_x, pin["lat"] - 5 * pt_to_data_y,
+                                    lon + 60 * pt_to_data_x, pin["lat"] + 68 * pt_to_data_y))
         dx_pt, dy_pt, ha = place_label(lon, pin["lat"], pin["name"], 14, dpi,
                                         deg_per_px_x, deg_per_px_y, placed_label_boxes)
         label = ax.annotate(pin["name"], xy=(lon, pin["lat"]), xytext=(dx_pt, dy_pt),
@@ -637,7 +750,7 @@ def draw_hemisphere_locator(world, country_row, out_path, box_w, box_h):
     gpd.GeoSeries([country_row.geometry]).plot(ax=ax, color=hex_of("brick_red"), zorder=4)
     center = country_row.geometry.representative_point()
     ax.plot(center.x, center.y, "o", markersize=10, color=hex_of("brick_red"),
-             markeredgecolor="white", markeredgewidth=1.8, zorder=5)
+             markeredgecolor="black", markeredgewidth=1.8, zorder=5)
 
     ax.axhline(0, color="#555555", linewidth=0.5, linestyle="--", zorder=3)  # equator line
     ax.set_xlim(-180, 180)
@@ -714,11 +827,14 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
                     outline=rgb("ocean_blue"), width=3)
     canvas.paste(flag_fitted, (flag_x, flag_y), flag_fitted)
 
-    # Country name — auto-sized so long names never overflow
+    # Country name — auto-sized so long names never overflow, centered
+    # in the space between the flag and the locator
     name_x = flag_x + FLAG_BOX_W + 40
     name_max_w = CANVAS_W - LOCATOR_W - name_x - 40
     f_title = autosize_font(draw, country_name.upper(), name_max_w, start_size=72, min_size=32)
-    draw.text((name_x, strip_y0 + 40), country_name.upper(), font=f_title, fill=rgb("text_dark"))
+    title_w = draw.textlength(country_name.upper(), font=f_title)
+    draw.text((name_x + (name_max_w - title_w) / 2, strip_y0 + 40),
+              country_name.upper(), font=f_title, fill=rgb("text_dark"))
 
     # Facts strip — Capital / Language / Currency / Climate only
     f_label = load_font(22, bold=True)
