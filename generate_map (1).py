@@ -71,6 +71,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+from matplotlib.path import Path as MplPath
+from matplotlib.patches import PathPatch
 from PIL import Image, ImageDraw, ImageFont
 from shapely.geometry import box as shp_box, Point
 from shapely.ops import transform as shp_transform, unary_union
@@ -729,6 +731,48 @@ def draw_ocean_depth_shading(ax, land_union, minx, miny, maxx, maxy, grid_n=90):
               zorder=0, aspect="auto", interpolation="bilinear")
 
 
+def geometry_to_mpl_path(geometry):
+    """Converts a shapely (Multi)Polygon to a matplotlib Path (honoring
+    holes), so it can be used to clip an imshow gradient to a country's
+    exact shape."""
+    verts, codes = [], []
+    polys = geometry.geoms if geometry.geom_type == "MultiPolygon" else [geometry]
+    for poly in polys:
+        for ring in [poly.exterior, *poly.interiors]:
+            coords = list(ring.coords)
+            if len(coords) < 3:
+                continue
+            verts.extend(coords)
+            codes.extend([MplPath.MOVETO] + [MplPath.LINETO] * (len(coords) - 2) + [MplPath.CLOSEPOLY])
+    return MplPath(verts, codes)
+
+
+def lighten(rgb_tuple, frac):
+    return tuple(min(255, int(c + (255 - c) * frac)) for c in rgb_tuple)
+
+
+def darken(rgb_tuple, frac):
+    return tuple(int(c * (1 - frac)) for c in rgb_tuple)
+
+
+def draw_country_gradient_fill(ax, geometry, base_hex, zorder=1):
+    """Fills a country with a subtle light-to-dark gradient (lighter
+    toward the top) instead of one flat color, clipped exactly to its
+    shape — a bit of polish/depth per country instead of a flat block,
+    without changing the actual hue used to distinguish it."""
+    base_rgb = tuple(int(base_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+    # LinearSegmentedColormap wants 0-1 floats, not 0-255 ints — every
+    # channel was clamping to 1.0 (white) without this conversion.
+    to_unit = lambda rgb: tuple(c / 255 for c in rgb)
+    cmap = LinearSegmentedColormap.from_list(
+        "shade", [to_unit(darken(base_rgb, 0.22)), to_unit(lighten(base_rgb, 0.30))])
+    grad = np.linspace(0, 1, 256).reshape(256, 1)
+    gminx, gminy, gmaxx, gmaxy = geometry.bounds
+    im = ax.imshow(grad, extent=(gminx, gmaxx, gminy, gmaxy), origin="lower",
+                    cmap=cmap, aspect="auto", zorder=zorder, interpolation="bilinear")
+    im.set_clip_path(PathPatch(geometry_to_mpl_path(geometry), transform=ax.transData))
+
+
 def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_px, target_h_px):
     dpi = 150
     ocean = hex_of("ocean_light")
@@ -750,19 +794,31 @@ def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_p
         )
 
     land_pieces = [country_geom]
+    visible_rows = []
     for _, row in world_to_plot.iterrows():
         if row.geometry is None:
             continue
         clipped = row.geometry.intersection(view_box)
         if not clipped.is_empty:
             land_pieces.append(clipped)
+            visible_rows.append(row)
     draw_ocean_depth_shading(ax, unary_union(land_pieces), minx, miny, maxx, maxy)
 
+    # Each country gets its own light-to-dark gradient fill (clipped to
+    # its real, unclipped shape — clipping to the view box first would
+    # draw a fake border line at the edge of the frame) instead of one
+    # flat color, for a bit more visual polish.
     name_col = next((c for c in ["NAME", "ADMIN", "SOVEREIGNT"] if c in world_to_plot.columns), None)
-    neighbor_colors = world_to_plot[name_col].map(neighbor_color_for) if name_col else hex_of("neighbor_land")
-    world_to_plot.plot(ax=ax, color=neighbor_colors, edgecolor="white", linewidth=0.7)
-    gpd.GeoSeries([country_geom]).plot(
-        ax=ax, color=hex_of("highlight_land"), edgecolor="#2f5c3d", linewidth=1.8
+    for row in visible_rows:
+        color = neighbor_color_for(row[name_col]) if name_col else hex_of("neighbor_land")
+        draw_country_gradient_fill(ax, row.geometry, color, zorder=1)
+    if visible_rows:
+        gpd.GeoSeries([row.geometry for row in visible_rows], crs=world_to_plot.crs).plot(
+            ax=ax, facecolor="none", edgecolor="white", linewidth=0.7, zorder=1.5)
+
+    draw_country_gradient_fill(ax, country_geom, hex_of("highlight_land"), zorder=2)
+    gpd.GeoSeries([country_geom], crs=world_to_plot.crs).plot(
+        ax=ax, facecolor="none", edgecolor="#2f5c3d", linewidth=1.8, zorder=2.5
     )
 
     draw_neighbor_labels(ax, world_to_plot, country_row.name, view_box)
