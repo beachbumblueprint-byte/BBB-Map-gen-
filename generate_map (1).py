@@ -449,9 +449,9 @@ def draw_neighbor_labels(ax, world_to_plot, country_idx, view_box):
         candidates.append((clipped.area, row[name_col], clipped.representative_point()))
     candidates.sort(key=lambda c: c[0], reverse=True)
     for _, name, point in candidates[:6]:
-        txt = ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=15,
+        txt = ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=19,
                        fontweight="bold", ha="center", va="center", zorder=3)
-        txt.set_path_effects([pe.withStroke(linewidth=3.5, foreground="white")])
+        txt.set_path_effects([pe.withStroke(linewidth=4.5, foreground="white")])
 
 
 def boxes_overlap(a, b):
@@ -795,14 +795,15 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), rgb("white"))
     draw = ImageDraw.Draw(canvas)
 
-    # ---- Header bar ----
+    # ---- Header bar ---- website is the headline (that's the brand
+    # we're selling); the map-series label is small print on the right.
     draw.rectangle([0, 0, CANVAS_W, HEADER_H], fill=rgb("navy_header"))
     f_header = load_font(34, bold=True)
-    f_header_small = load_font(26, bold=True)
-    draw.text((30, 25), "BEACH BUM BLUEPRINT MAP SERIES", font=f_header, fill=rgb("white"))
-    label = WEBSITE.upper()
+    f_header_small = load_font(20, bold=True)
+    draw.text((30, 25), WEBSITE.upper(), font=f_header, fill=rgb("aqua"))
+    label = "BEACH BUM BLUEPRINT MAP SERIES"
     w = draw.textlength(label, font=f_header_small)
-    draw.text((CANVAS_W - w - 30, 30), label, font=f_header_small, fill=rgb("aqua"))
+    draw.text((CANVAS_W - w - 30, 35), label, font=f_header_small, fill=rgb("white"))
 
     # ---- Top strip: flag, name, facts (left) + locator (right) ----
     strip_y0 = HEADER_H
@@ -836,7 +837,10 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
     draw.text((name_x + (name_max_w - title_w) / 2, strip_y0 + 40),
               country_name.upper(), font=f_title, fill=rgb("text_dark"))
 
-    # Facts strip — Capital / Language / Currency / Climate only
+    # Facts strip — Capital / Language / Currency / Climate only. Sized
+    # to its actual rendered content (not a fixed half-width column) and
+    # then centered as a block, so it lines up under the also-centered
+    # title instead of looking left-shifted against it.
     f_label = load_font(22, bold=True)
     f_value = load_font(22)
     facts_y = strip_y0 + 130
@@ -846,15 +850,21 @@ def compose_poster(country_name, facts, pins, main_map_path, locator_path, out_p
         ("Currency", facts["currency"]),
         ("Climate", facts["climate"]),
     ]
-    col_w = name_max_w // 2
+    wrapped_values = [textwrap.shorten(v, width=30, placeholder="...") for _, v in facts_list]
+    col_content_w = max(
+        max(draw.textlength(f"{l}:", font=f_label) for l, _ in facts_list),
+        max(draw.textlength(v, font=f_value) for v in wrapped_values),
+    )
+    col_gutter = 70
+    col_w = col_content_w + col_gutter
+    facts_block_x = name_x + (name_max_w - (col_w * 2 - col_gutter)) / 2
     for i, (label_text, value_text) in enumerate(facts_list):
         col = i % 2
         row = i // 2
-        fx = name_x + col * col_w
+        fx = facts_block_x + col * col_w
         fy = facts_y + row * 70
         draw.text((fx, fy), f"{label_text}:", font=f_label, fill=rgb("ocean_blue"))
-        wrapped = textwrap.shorten(value_text, width=30, placeholder="...")
-        draw.text((fx, fy + 30), wrapped, font=f_value, fill=rgb("text_dark"))
+        draw.text((fx, fy + 30), wrapped_values[i], font=f_value, fill=rgb("text_dark"))
 
     # Locator — top right corner of the strip. Sized to its true aspect
     # ratio (see LOCATOR_H) so it fills the box with no letterboxing,
