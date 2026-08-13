@@ -69,10 +69,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
+from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 from PIL import Image, ImageDraw, ImageFont
 from shapely.geometry import box as shp_box, Point
-from shapely.ops import transform as shp_transform
+from shapely.ops import transform as shp_transform, unary_union
 from shapely.prepared import prep
 
 # ---------------------------------------------------------------------
@@ -464,9 +465,9 @@ def draw_neighbor_labels(ax, world_to_plot, country_idx, view_box):
         candidates.append((clipped.area, row[name_col], clipped.representative_point()))
     candidates.sort(key=lambda c: c[0], reverse=True)
     for _, name, point in candidates[:6]:
-        txt = ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=19,
+        txt = ax.text(point.x, point.y, name, color=hex_of("navy_header"), fontsize=26,
                        fontweight="bold", ha="center", va="center", zorder=3)
-        txt.set_path_effects([pe.withStroke(linewidth=4.5, foreground="white")])
+        txt.set_path_effects([pe.withStroke(linewidth=6, foreground="white")])
 
 
 def draw_ocean_labels(ax, marine, view_box, placed_boxes, dpi, deg_per_px_x, deg_per_px_y, max_labels=3):
@@ -488,7 +489,7 @@ def draw_ocean_labels(ax, marine, view_box, placed_boxes, dpi, deg_per_px_x, deg
         candidates.append((clipped.area, row["name"], clipped.representative_point()))
     candidates.sort(key=lambda c: c[0], reverse=True)
     minx, miny, maxx, maxy = view_box.bounds
-    fontsize = 20
+    fontsize = 26
     placed = 0
     for _, name, point in candidates:
         if placed >= max_labels:
@@ -501,7 +502,7 @@ def draw_ocean_labels(ax, marine, view_box, placed_boxes, dpi, deg_per_px_x, deg
         placed_boxes.append(box)
         txt = ax.text(point.x, point.y, name, color=hex_of("ocean_blue"), fontsize=fontsize,
                        fontweight="bold", fontstyle="italic", ha="center", va="center", zorder=2)
-        txt.set_path_effects([pe.withStroke(linewidth=4, foreground="white")])
+        txt.set_path_effects([pe.withStroke(linewidth=6, foreground="white")])
         placed += 1
 
 
@@ -710,6 +711,25 @@ def draw_diver_flag(ax, lon, lat, number):
     ax.add_artist(ab)
 
 
+def draw_ocean_depth_shading(ax, land_union, minx, miny, maxx, maxy, grid_n=90):
+    """Soft depth gradient for the ocean — lighter near coastlines,
+    deeper brand blue further out — so a big stretch of open water
+    reads as intentional depth shading (like a printed travel map)
+    instead of one flat, boring block of color. Land polygons are
+    drawn on top afterward, so accuracy right at the coastline doesn't
+    matter — this only has to look right offshore."""
+    xs = np.linspace(minx, maxx, grid_n)
+    ys = np.linspace(miny, maxy, grid_n)
+    max_dist = ((maxx - minx) ** 2 + (maxy - miny) ** 2) ** 0.5 * 0.35
+    grid = np.empty((len(ys), len(xs)))
+    for j, y in enumerate(ys):
+        for i, x in enumerate(xs):
+            grid[j, i] = min(land_union.distance(Point(x, y)) / max_dist, 1.0)
+    cmap = LinearSegmentedColormap.from_list("depth", [hex_of("ocean_light"), hex_of("ocean_blue")])
+    ax.imshow(grid, extent=(minx, maxx, miny, maxy), origin="lower", cmap=cmap,
+              zorder=0, aspect="auto", interpolation="bilinear")
+
+
 def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_px, target_h_px):
     dpi = 150
     ocean = hex_of("ocean_light")
@@ -721,6 +741,7 @@ def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_p
     minx, miny, maxx, maxy = country_geom.bounds
     target_aspect = target_w_px / target_h_px
     minx, miny, maxx, maxy = compute_padded_extent(minx, miny, maxx, maxy, target_aspect)
+    view_box = shp_box(minx, miny, maxx, maxy)
 
     world_to_plot = world
     if wrapped:
@@ -729,6 +750,15 @@ def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_p
             lambda g: fix_dateline_wrap(g)[0] if g is not None else g
         )
 
+    land_pieces = [country_geom]
+    for _, row in world_to_plot.iterrows():
+        if row.geometry is None:
+            continue
+        clipped = row.geometry.intersection(view_box)
+        if not clipped.is_empty:
+            land_pieces.append(clipped)
+    draw_ocean_depth_shading(ax, unary_union(land_pieces), minx, miny, maxx, maxy)
+
     name_col = next((c for c in ["NAME", "ADMIN", "SOVEREIGNT"] if c in world_to_plot.columns), None)
     neighbor_colors = world_to_plot[name_col].map(neighbor_color_for) if name_col else hex_of("neighbor_land")
     world_to_plot.plot(ax=ax, color=neighbor_colors, edgecolor="white", linewidth=0.7)
@@ -736,7 +766,6 @@ def draw_main_map(world, country_row, pins, cities, marine, out_path, target_w_p
         ax=ax, color=hex_of("highlight_land"), edgecolor="#2f5c3d", linewidth=1.8
     )
 
-    view_box = shp_box(minx, miny, maxx, maxy)
     draw_neighbor_labels(ax, world_to_plot, country_row.name, view_box)
 
     deg_per_px_x = (maxx - minx) / target_w_px
